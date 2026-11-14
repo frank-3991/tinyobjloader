@@ -2735,6 +2735,254 @@ void test_loadobjopt_degenerate_face_warning_suppressed_on_parse_error() {
   TEST_CHECK(opt_warn.find("Degenerated face found") == std::string::npos);
 }
 
+// Fixture mixing every kind of degenerate face with valid neighbors, using
+// texcoords, normals, a material and a smoothing group so attribute mapping
+// can be checked.  Faces, in order:
+//   1. quad whose last corner repeats the first (A B C A): the [0,1,2]
+//      split is a valid triangle while [0,2,3] repeats a corner and is
+//      dropped, proving per-corner vt/vn indices follow the surviving part
+//   2. zero-area triangle (repeated vertex)
+//   3. fully collinear pentagon (every split triangle is degenerate)
+//   4. valid quad (two triangles)
+//   5. valid triangle
+static std::string BuildMixedDegenerateObj() {
+  return
+      "v 0 0 0\n"
+      "v 4 0 0\n"
+      "v 3 3 0\n"
+      "v 0 3 0\n"
+      "v 2 0 0\n"
+      "v 3 0 0\n"
+      "v 4 0 0\n"
+      "v 5 0 0\n"
+      "v 0 0 1\n"
+      "vt 0 0\n"
+      "vt 1 0\n"
+      "vt 1 1\n"
+      "vt 0 1\n"
+      "vt 2 0\n"
+      "vn 0 0 1\n"
+      "s 1\n"
+      "f 1/1/1 2/2/1 3/3/1 1/1/1\n"
+      "f 1/1/1 1/1/1 3/3/1\n"
+      "f 5 6 7 8 6\n"
+      "f 1/1/1 2/2/1 3/3/1 4/4/1\n"
+      "f 1/1/1 2/2/1 9/5/1\n";
+}
+
+// The surviving faces are the valid triangle of face 1, the two triangles
+// of face 4 and the triangle of face 5: 4 triangles total.
+static const size_t kMixedDegenerateTriangles = 4;
+
+// Expected flattened (v, vt, vn) corners of the surviving triangles, proving
+// order, winding and per-corner attribute indices are preserved.  Face 1 has
+// two equal-length diagonals so the loader uses its [1,2,0]/[1,0,3] split;
+// only [1,2,0] has non-zero area, keeping its original winding.  Face 4 is an
+// asymmetric trapezoid, so its shorter diagonal (0,2) deterministically
+// selects the [0,1,2]/[0,2,3] split.
+static const int kMixedDegenerateExpected[][3] = {
+    {1, 1, 0}, {2, 2, 0}, {0, 0, 0},  // face 1: only [1, 2, 0] survives
+    {0, 0, 0}, {1, 1, 0}, {2, 2, 0},  // face 4, triangle [0, 1, 2]
+    {0, 0, 0}, {2, 2, 0}, {3, 3, 0},  // face 4, triangle [0, 2, 3]
+    {0, 0, 0}, {1, 1, 0}, {8, 4, 0},  // face 5
+};
+
+static void CheckMixedDegenerateIndices(const tinyobj::index_t *indices,
+                                        size_t index_count) {
+  TEST_CHECK(index_count == kMixedDegenerateTriangles * 3);
+  for (size_t i = 0; i < index_count && i < kMixedDegenerateTriangles * 3;
+       i++) {
+    TEST_CHECK(indices[i].vertex_index == kMixedDegenerateExpected[i][0]);
+    TEST_CHECK(indices[i].texcoord_index == kMixedDegenerateExpected[i][1]);
+    TEST_CHECK(indices[i].normal_index == kMixedDegenerateExpected[i][2]);
+  }
+}
+
+void test_degenerate_triangulation_legacy_drops_invalid_triangles() {
+  const std::string obj_text = BuildMixedDegenerateObj();
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  std::istringstream stream(obj_text);
+  bool ok = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                             &stream, NULL, /*triangulate=*/true, false);
+  TEST_CHECK(ok == true);
+  TEST_CHECK(err.empty());
+  TEST_CHECK(shapes.size() == 1);
+  TEST_CHECK(shapes[0].mesh.num_face_vertices.size() ==
+             kMixedDegenerateTriangles);
+  for (size_t i = 0; i < shapes[0].mesh.num_face_vertices.size(); i++) {
+    TEST_CHECK(shapes[0].mesh.num_face_vertices[i] == 3);
+    // Every emitted triangle keeps the source face smoothing group.
+    TEST_CHECK(shapes[0].mesh.smoothing_group_ids[i] == 1);
+  }
+  CheckMixedDegenerateIndices(shapes[0].mesh.indices.data(),
+                              shapes[0].mesh.indices.size());
+}
+
+void test_degenerate_triangulation_opt_matches_legacy() {
+  const std::string obj_text = BuildMixedDegenerateObj();
+
+  tinyobj::attrib_t legacy_attrib;
+  std::vector<tinyobj::shape_t> legacy_shapes;
+  std::vector<tinyobj::material_t> legacy_materials;
+  std::string legacy_warn, legacy_err;
+  std::istringstream legacy_stream(obj_text);
+  bool legacy_ok = tinyobj::LoadObj(&legacy_attrib, &legacy_shapes,
+                                    &legacy_materials, &legacy_warn,
+                                    &legacy_err, &legacy_stream, NULL,
+                                    true, false);
+
+  for (int nth = 1; nth <= 2; nth++) {
+    tinyobj::basic_attrib_t<> opt_attrib;
+    std::vector<tinyobj::basic_shape_t<>> opt_shapes;
+    std::vector<tinyobj::material_t> opt_materials;
+    std::string opt_warn, opt_err;
+    tinyobj::OptLoadConfig config;
+    config.num_threads = nth;
+    config.triangulate = true;
+    bool opt_ok = tinyobj::LoadObjOpt(
+        &opt_attrib, &opt_shapes, &opt_materials, &opt_warn, &opt_err,
+        obj_text.c_str(), obj_text.size(), config);
+
+    TEST_CHECK(legacy_ok == true);
+    TEST_CHECK(opt_ok == true);
+    TEST_CHECK(legacy_warn == opt_warn);
+    TEST_CHECK(legacy_err == opt_err);
+    TEST_CHECK(opt_attrib.face_num_verts.size() ==
+               kMixedDegenerateTriangles);
+    TEST_CHECK(opt_attrib.indices.size() ==
+               kMixedDegenerateTriangles * 3);
+    // Material/smoothing arrays stay parallel to the emitted triangles.
+    TEST_CHECK(opt_attrib.material_ids.size() ==
+               kMixedDegenerateTriangles);
+    CheckMixedDegenerateIndices(opt_attrib.indices.data(),
+                                opt_attrib.indices.size());
+    TEST_CHECK(opt_test::LegacyAttribEqualsOpt(legacy_attrib, legacy_shapes,
+                                               opt_attrib));
+    TEST_CHECK(opt_test::LegacyShapesEqualOpt(legacy_shapes, opt_shapes));
+  }
+}
+
+void test_degenerate_triangulation_stream_matches_legacy() {
+  const std::string obj_text = BuildMixedDegenerateObj();
+
+  tinyobj::attrib_t legacy_attrib;
+  std::vector<tinyobj::shape_t> legacy_shapes;
+  std::vector<tinyobj::material_t> legacy_materials;
+  std::string legacy_warn, legacy_err;
+  std::istringstream legacy_stream(obj_text);
+  bool legacy_ok = tinyobj::LoadObj(&legacy_attrib, &legacy_shapes,
+                                    &legacy_materials, &legacy_warn,
+                                    &legacy_err, &legacy_stream, NULL,
+                                    true, false);
+
+  tinyobj::attrib_t stream_attrib;
+  std::vector<tinyobj::shape_t> stream_shapes;
+  std::vector<tinyobj::material_t> stream_materials;
+  std::string stream_warn, stream_err;
+  std::istringstream stream(obj_text);
+  tinyobj::experimental_stream::StreamLoadConfig config;
+  config.triangulate = true;
+  bool stream_ok = tinyobj::experimental_stream::LoadObjStreamExperimental(
+      &stream_attrib, &stream_shapes, &stream_materials, &stream_warn,
+      &stream_err, &stream, NULL, config);
+
+  TEST_CHECK(legacy_ok == true);
+  TEST_CHECK(stream_ok == true);
+  TEST_CHECK(legacy_warn == stream_warn);
+  TEST_CHECK(legacy_err == stream_err);
+  TEST_CHECK(stream_shapes.size() == 1);
+  TEST_CHECK(stream_shapes[0].mesh.num_face_vertices.size() ==
+             kMixedDegenerateTriangles);
+  CheckMixedDegenerateIndices(stream_shapes[0].mesh.indices.data(),
+                              stream_shapes[0].mesh.indices.size());
+  TEST_CHECK(legacy_shapes[0].mesh.indices.size() ==
+             stream_shapes[0].mesh.indices.size());
+  for (size_t i = 0; i < stream_shapes[0].mesh.indices.size(); i++) {
+    TEST_CHECK(opt_test::IndexEquals(legacy_shapes[0].mesh.indices[i],
+                                     stream_shapes[0].mesh.indices[i]));
+  }
+  TEST_CHECK(legacy_shapes[0].mesh.num_face_vertices ==
+             stream_shapes[0].mesh.num_face_vertices);
+  TEST_CHECK(legacy_shapes[0].mesh.material_ids ==
+             stream_shapes[0].mesh.material_ids);
+  TEST_CHECK(legacy_shapes[0].mesh.smoothing_group_ids ==
+             stream_shapes[0].mesh.smoothing_group_ids);
+}
+
+// With triangulation disabled the raw polygon faces must pass through
+// unchanged, including the degenerate ones.
+void test_degenerate_faces_passthrough_without_triangulation() {
+  const std::string obj_text = BuildMixedDegenerateObj();
+
+  tinyobj::attrib_t legacy_attrib;
+  std::vector<tinyobj::shape_t> legacy_shapes;
+  std::vector<tinyobj::material_t> legacy_materials;
+  std::string legacy_warn, legacy_err;
+  std::istringstream legacy_stream(obj_text);
+  bool legacy_ok = tinyobj::LoadObj(&legacy_attrib, &legacy_shapes,
+                                    &legacy_materials, &legacy_warn,
+                                    &legacy_err, &legacy_stream, NULL,
+                                    /*triangulate=*/false, false);
+
+  tinyobj::basic_attrib_t<> opt_attrib;
+  std::vector<tinyobj::basic_shape_t<>> opt_shapes;
+  std::vector<tinyobj::material_t> opt_materials;
+  std::string opt_warn, opt_err;
+  tinyobj::OptLoadConfig config;
+  config.num_threads = 2;
+  config.triangulate = false;
+  bool opt_ok = tinyobj::LoadObjOpt(&opt_attrib, &opt_shapes, &opt_materials,
+                                    &opt_warn, &opt_err, obj_text.c_str(),
+                                    obj_text.size(), config);
+
+  TEST_CHECK(legacy_ok == true);
+  TEST_CHECK(opt_ok == true);
+  // All five raw faces survive with their original arities (4, 3, 5, 4, 3).
+  TEST_CHECK(opt_attrib.face_num_verts.size() == 5);
+  const int expected_arity[5] = {4, 3, 5, 4, 3};
+  for (size_t i = 0; i < 5; i++) {
+    TEST_CHECK(opt_attrib.face_num_verts[i] == expected_arity[i]);
+  }
+  TEST_CHECK(opt_attrib.indices.size() == 19u);
+  TEST_CHECK(opt_test::LegacyAttribEqualsOpt(legacy_attrib, legacy_shapes,
+                                             opt_attrib));
+  TEST_CHECK(opt_test::LegacyShapesEqualOpt(legacy_shapes, opt_shapes));
+}
+
+// A standalone zero-area triangle and a fully collinear polygon produce no
+// geometry at all, without breaking the surrounding valid face.
+void test_fully_degenerate_faces_emit_nothing() {
+  const std::string obj_text =
+      "v 0 0 0\n"
+      "v 1 0 0\n"
+      "v 1 1 0\n"
+      "v 2 0 0\n"
+      "v 3 0 0\n"
+      "v 4 0 0\n"
+      "f 1 1 2\n"          // zero-area triangle
+      "f 4 5 6 5\n"        // collinear quad (repeated corner, zero area)
+      "f 1 2 3\n";         // valid triangle
+
+  tinyobj::basic_attrib_t<> attrib;
+  std::vector<tinyobj::basic_shape_t<>> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  tinyobj::OptLoadConfig config;
+  config.triangulate = true;
+  bool ok = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
+                                obj_text.c_str(), obj_text.size(), config);
+  TEST_CHECK(ok == true);
+  TEST_CHECK(err.empty());
+  TEST_CHECK(attrib.face_num_verts.size() == 1);
+  TEST_CHECK(attrib.indices.size() == 3u);
+  TEST_CHECK(attrib.indices[0].vertex_index == 0);
+  TEST_CHECK(attrib.indices[1].vertex_index == 1);
+  TEST_CHECK(attrib.indices[2].vertex_index == 2);
+}
+
 void test_loadobjopt_initial_named_shape_matches_legacy() {
   const std::string obj_text = opt_test::BuildInitialNamedShapeThenBoundaryObj();
 

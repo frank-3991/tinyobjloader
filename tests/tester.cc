@@ -3580,11 +3580,12 @@ void test_loadobjopt_leading_decimal_dot() {
 }
 
 void test_loadobjopt_no_trailing_newline() {
-  // Buffer without trailing newline (tests sentinel handling)
+  // Buffer without trailing newline (tests sentinel handling).  The vertices
+  // form a non-degenerate triangle so the face survives triangulation.
   const char *obj_text =
       "v 1.0 2.0 3.0\n"
       "v 4.0 5.0 6.0\n"
-      "v 7.0 8.0 9.0\n"
+      "v 7.0 8.0 8.0\n"
       "f 1 2 3";  // no trailing newline
   size_t obj_len = strlen(obj_text);
 
@@ -4431,6 +4432,16 @@ TEST_LIST = {
      test_loadobjopt_degenerate_face_warning_order_matches_legacy},
     {"test_loadobjopt_degenerate_face_warning_suppressed_on_parse_error",
      test_loadobjopt_degenerate_face_warning_suppressed_on_parse_error},
+    {"test_degenerate_triangulation_legacy_drops_invalid_triangles",
+     test_degenerate_triangulation_legacy_drops_invalid_triangles},
+    {"test_degenerate_triangulation_opt_matches_legacy",
+     test_degenerate_triangulation_opt_matches_legacy},
+    {"test_degenerate_triangulation_stream_matches_legacy",
+     test_degenerate_triangulation_stream_matches_legacy},
+    {"test_degenerate_faces_passthrough_without_triangulation",
+     test_degenerate_faces_passthrough_without_triangulation},
+    {"test_fully_degenerate_faces_emit_nothing",
+     test_fully_degenerate_faces_emit_nothing},
     {"test_loadobjopt_initial_named_shape_matches_legacy",
      test_loadobjopt_initial_named_shape_matches_legacy},
     {"test_loadobjopt_invalid_relative_vertex_index_matches_legacy_error",

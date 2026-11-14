@@ -138,20 +138,6 @@ static bool ParseIntToken(const std::string &token, int *value) {
   return true;
 }
 
-template <typename T>
-static int PointInPolygon(int nvert, T *vertx, T *verty, T testx, T testy) {
-  int c = 0;
-  for (int i = 0, j = nvert - 1; i < nvert; j = i++) {
-    if (((verty[i] > testy) != (verty[j] > testy)) &&
-        (testx < (vertx[j] - vertx[i]) * (testy - verty[i]) /
-                         (verty[j] - verty[i]) +
-                     vertx[i])) {
-      c = !c;
-    }
-  }
-  return c;
-}
-
 static void AppendZeroIndexWarning(std::string *warn,
                                    const std::string &source_name,
                                    size_t line_num) {
@@ -217,178 +203,14 @@ static void AppendOutOfBoundsWarnings(std::string *warn,
   }
 }
 
-static bool IsValidFaceVertex(const std::vector<real_t> &vertices,
-                              const index_t &idx) {
-  if (idx.vertex_index < 0) return false;
-  const size_t vi = static_cast<size_t>(idx.vertex_index);
-  return ((3 * vi + 2) < vertices.size());
-}
-
+// Triangulation (including degenerate-triangle filtering) is shared with the
+// classic and optimized loaders in tiny_obj_loader.h, so every loading path
+// produces identical face counts and attribute mappings for the same input.
 static size_t TriangulateFaceLikeLegacy(const std::vector<real_t> &vertices,
                                         const index_t *face, size_t face_count,
                                         index_t *dst) {
-  if (face_count < 3) return 0;
-  if (face_count == 3) {
-    dst[0] = face[0];
-    dst[1] = face[1];
-    dst[2] = face[2];
-    return 3;
-  }
-
-  for (size_t i = 0; i < face_count; i++) {
-    if (!IsValidFaceVertex(vertices, face[i])) {
-      return 0;
-    }
-  }
-
-  if (face_count == 4) {
-    const size_t vi0 = static_cast<size_t>(face[0].vertex_index);
-    const size_t vi1 = static_cast<size_t>(face[1].vertex_index);
-    const size_t vi2 = static_cast<size_t>(face[2].vertex_index);
-    const size_t vi3 = static_cast<size_t>(face[3].vertex_index);
-    const real_t v0x = vertices[vi0 * 3 + 0];
-    const real_t v0y = vertices[vi0 * 3 + 1];
-    const real_t v0z = vertices[vi0 * 3 + 2];
-    const real_t v1x = vertices[vi1 * 3 + 0];
-    const real_t v1y = vertices[vi1 * 3 + 1];
-    const real_t v1z = vertices[vi1 * 3 + 2];
-    const real_t v2x = vertices[vi2 * 3 + 0];
-    const real_t v2y = vertices[vi2 * 3 + 1];
-    const real_t v2z = vertices[vi2 * 3 + 2];
-    const real_t v3x = vertices[vi3 * 3 + 0];
-    const real_t v3y = vertices[vi3 * 3 + 1];
-    const real_t v3z = vertices[vi3 * 3 + 2];
-    const real_t e02x = v2x - v0x;
-    const real_t e02y = v2y - v0y;
-    const real_t e02z = v2z - v0z;
-    const real_t e13x = v3x - v1x;
-    const real_t e13y = v3y - v1y;
-    const real_t e13z = v3z - v1z;
-    const real_t sqr02 = e02x * e02x + e02y * e02y + e02z * e02z;
-    const real_t sqr13 = e13x * e13x + e13y * e13y + e13z * e13z;
-    if (sqr02 < sqr13) {
-      dst[0] = face[0];
-      dst[1] = face[1];
-      dst[2] = face[2];
-      dst[3] = face[0];
-      dst[4] = face[2];
-      dst[5] = face[3];
-    } else {
-      dst[0] = face[0];
-      dst[1] = face[1];
-      dst[2] = face[3];
-      dst[3] = face[1];
-      dst[4] = face[2];
-      dst[5] = face[3];
-    }
-    return 6;
-  }
-
-  std::vector<index_t> remaining(face, face + face_count);
-  size_t axes[2] = {1, 2};
-  for (size_t k = 0; k < face_count; ++k) {
-    const size_t vi0 = static_cast<size_t>(face[(k + 0) % face_count].vertex_index);
-    const size_t vi1 = static_cast<size_t>(face[(k + 1) % face_count].vertex_index);
-    const size_t vi2 = static_cast<size_t>(face[(k + 2) % face_count].vertex_index);
-    const real_t v0x = vertices[vi0 * 3 + 0];
-    const real_t v0y = vertices[vi0 * 3 + 1];
-    const real_t v0z = vertices[vi0 * 3 + 2];
-    const real_t v1x = vertices[vi1 * 3 + 0];
-    const real_t v1y = vertices[vi1 * 3 + 1];
-    const real_t v1z = vertices[vi1 * 3 + 2];
-    const real_t v2x = vertices[vi2 * 3 + 0];
-    const real_t v2y = vertices[vi2 * 3 + 1];
-    const real_t v2z = vertices[vi2 * 3 + 2];
-    const real_t e0x = v1x - v0x;
-    const real_t e0y = v1y - v0y;
-    const real_t e0z = v1z - v0z;
-    const real_t e1x = v2x - v1x;
-    const real_t e1y = v2y - v1y;
-    const real_t e1z = v2z - v1z;
-    const real_t cx = std::fabs(e0y * e1z - e0z * e1y);
-    const real_t cy = std::fabs(e0z * e1x - e0x * e1z);
-    const real_t cz = std::fabs(e0x * e1y - e0y * e1x);
-    const real_t epsilon = std::numeric_limits<real_t>::epsilon();
-    if (cx > epsilon || cy > epsilon || cz > epsilon) {
-      if (!(cx > cy && cx > cz)) {
-        axes[0] = 0;
-        if (cz > cx && cz > cy) {
-          axes[1] = 1;
-        }
-      }
-      break;
-    }
-  }
-
-  size_t out = 0;
-  size_t guess_vert = 0;
-  size_t remaining_iterations = remaining.size();
-  size_t previous_remaining_vertices = remaining.size();
-  while (remaining.size() > 3 && remaining_iterations > 0) {
-    const size_t npolys = remaining.size();
-    if (guess_vert >= npolys) {
-      guess_vert -= npolys;
-    }
-    if (previous_remaining_vertices != npolys) {
-      previous_remaining_vertices = npolys;
-      remaining_iterations = npolys;
-    } else {
-      remaining_iterations--;
-    }
-
-    index_t ind[3];
-    real_t vx[3];
-    real_t vy[3];
-    for (size_t k = 0; k < 3; k++) {
-      ind[k] = remaining[(guess_vert + k) % npolys];
-      const size_t vi = static_cast<size_t>(ind[k].vertex_index);
-      vx[k] = vertices[vi * 3 + axes[0]];
-      vy[k] = vertices[vi * 3 + axes[1]];
-    }
-
-    const real_t e0x = vx[1] - vx[0];
-    const real_t e0y = vy[1] - vy[0];
-    const real_t e1x = vx[2] - vx[1];
-    const real_t e1y = vy[2] - vy[1];
-    const real_t cross_val = e0x * e1y - e0y * e1x;
-    const real_t area =
-        (vx[0] * vy[1] - vy[0] * vx[1]) * static_cast<real_t>(0.5);
-    if (cross_val * area < static_cast<real_t>(0.0)) {
-      guess_vert += 1;
-      continue;
-    }
-
-    bool overlap = false;
-    for (size_t other_vert = 3; other_vert < npolys; ++other_vert) {
-      const size_t idx = (guess_vert + other_vert) % npolys;
-      const size_t ovi = static_cast<size_t>(remaining[idx].vertex_index);
-      const real_t tx = vertices[ovi * 3 + axes[0]];
-      const real_t ty = vertices[ovi * 3 + axes[1]];
-      if (PointInPolygon(3, vx, vy, tx, ty)) {
-        overlap = true;
-        break;
-      }
-    }
-
-    if (overlap) {
-      guess_vert += 1;
-      continue;
-    }
-
-    dst[out++] = ind[0];
-    dst[out++] = ind[1];
-    dst[out++] = ind[2];
-    remaining.erase(remaining.begin() +
-                    static_cast<std::ptrdiff_t>((guess_vert + 1) % npolys));
-  }
-
-  if (remaining.size() == 3) {
-    dst[out++] = remaining[0];
-    dst[out++] = remaining[1];
-    dst[out++] = remaining[2];
-  }
-
-  return out;
+  return tinyobj::triangulate_face_to_indices(
+      vertices.data(), vertices.size(), face, face_count, dst);
 }
 
 static bool ParseRawTripleToken(const std::string &token, RawIndex *out) {
@@ -1065,7 +887,12 @@ static bool ReplayChunk(const ParsedChunk &chunk, StreamHandler *handler,
             }
           }
 
-          if (config.triangulate && face.size() > 3) {
+          if (config.triangulate) {
+            // Route every face (including triangles) through the shared
+            // triangulator so duplicate-corner and zero-area faces are
+            // filtered exactly like the other loading paths.  At most
+            // (n - 2) triangles can be produced; fewer means the face was
+            // (partly) degenerate.
             std::vector<index_t> tris((face.size() - 2) * 3);
             const size_t tri_count = TriangulateFaceLikeLegacy(
                 *vertex_positions, face.data(), face.size(), tris.data());
