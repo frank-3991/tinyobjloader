@@ -4211,6 +4211,640 @@ void test_loadobjopt_mixed_line_endings() {
 
 #include "opt/loadobjopt_multithread.inc"
 
+// ---------------------------------------------------------------------------
+// Missing texcoord/normal (-1 sentinel) vs. negative (relative) indices
+//
+// A face vertex that omits the texcoord and/or normal component must produce
+// the -1 "not present" sentinel in the output indices, and that sentinel
+// must never be confused with a negative (relative) OBJ index that resolves
+// to an existing attribute.  The tests below cover full / partial / missing
+// attribute references mixed in one model, relative references across faces
+// that append new attributes, triangulation on/off, the stream (LoadObj),
+// buffer (LoadObjOpt) and file loading paths, and invalid relative
+// references adjacent to valid faces.
+// ---------------------------------------------------------------------------
+
+// Returns true when `idx` exactly matches the expected
+// (vertex, texcoord, normal) index triple.
+static bool FaceIndexEquals(const tinyobj::index_t &idx, int v, int vt,
+                            int vn) {
+  return idx.vertex_index == v && idx.texcoord_index == vt &&
+         idx.normal_index == vn;
+}
+
+// Flattens the per-shape mesh data of the legacy loader into single arrays
+// so it can be compared against LoadObjOpt's basic_attrib_t output.
+static void FlattenLegacyMeshes(const std::vector<tinyobj::shape_t> &shapes,
+                                std::vector<tinyobj::index_t> *indices,
+                                std::vector<int> *num_face_vertices,
+                                std::vector<int> *material_ids) {
+  for (size_t s = 0; s < shapes.size(); s++) {
+    indices->insert(indices->end(), shapes[s].mesh.indices.begin(),
+                    shapes[s].mesh.indices.end());
+    num_face_vertices->insert(num_face_vertices->end(),
+                              shapes[s].mesh.num_face_vertices.begin(),
+                              shapes[s].mesh.num_face_vertices.end());
+    material_ids->insert(material_ids->end(),
+                         shapes[s].mesh.material_ids.begin(),
+                         shapes[s].mesh.material_ids.end());
+  }
+}
+
+// A single model mixing fully-referenced faces (v/vt/vn), vertex-only faces
+// (v), and faces missing exactly one attribute (v//vn and v/vt).  Verifies
+// per-triangle vertex order, attribute correspondence, and material
+// assignment with the legacy stream loader.
+void test_face_missing_attr_mixed_full_and_vertex_only() {
+  const char *obj_text =
+      "mtllib scene.mtl\n"
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 1.0 1.0 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "vt 0.0 0.0\n"
+      "vt 1.0 0.0\n"
+      "vn 0.0 0.0 1.0\n"
+      "vn 0.0 1.0 0.0\n"
+      "usemtl mat_a\n"
+      "f 1/1/1 2/2/1 3/1/2\n"  // full reference
+      "f 2 3 4\n"              // vertex-only
+      "usemtl mat_b\n"
+      "f 1//2 3//2 4//1\n"     // texcoord missing
+      "f 1/1 2/2 4/1\n";       // normal missing
+  const char *mtl_text =
+      "newmtl mat_a\n"
+      "Kd 1.0 0.0 0.0\n"
+      "newmtl mat_b\n"
+      "Kd 0.0 1.0 0.0\n";
+
+  std::istringstream obj_stream(obj_text);
+  std::istringstream mtl_stream(mtl_text);
+  tinyobj::MaterialStreamReader mat_reader(mtl_stream);
+
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                              &obj_stream, &mat_reader);
+  TEST_CHECK(ret == true);
+  TEST_CHECK(err.empty());
+  TEST_CHECK(materials.size() == 2);
+
+  TEST_CHECK(attrib.vertices.size() == 12);  // 4 vertices
+  TEST_CHECK(attrib.normals.size() == 6);    // 2 normals
+  TEST_CHECK(attrib.texcoords.size() == 4);  // 2 texcoords
+
+  TEST_CHECK(shapes.size() == 1);
+  if (shapes.size() != 1) return;
+  const tinyobj::mesh_t &mesh = shapes[0].mesh;
+  TEST_CHECK(mesh.indices.size() == 12);
+  TEST_CHECK(mesh.num_face_vertices.size() == 4);
+  TEST_CHECK(mesh.material_ids.size() == 4);
+  if (mesh.indices.size() != 12 || mesh.num_face_vertices.size() != 4 ||
+      mesh.material_ids.size() != 4) {
+    return;
+  }
+
+  // Face 0: full v/vt/vn reference, vertex order preserved.
+  TEST_CHECK(FaceIndexEquals(mesh.indices[0], 0, 0, 0));
+  TEST_CHECK(FaceIndexEquals(mesh.indices[1], 1, 1, 0));
+  TEST_CHECK(FaceIndexEquals(mesh.indices[2], 2, 0, 1));
+
+  // Face 1: vertex-only — texcoord and normal must be the -1 sentinel,
+  // not a relative reference to the last texcoord/normal.
+  TEST_CHECK(FaceIndexEquals(mesh.indices[3], 1, -1, -1));
+  TEST_CHECK(FaceIndexEquals(mesh.indices[4], 2, -1, -1));
+  TEST_CHECK(FaceIndexEquals(mesh.indices[5], 3, -1, -1));
+
+  // Face 2: v//vn — only the texcoord is missing.
+  TEST_CHECK(FaceIndexEquals(mesh.indices[6], 0, -1, 1));
+  TEST_CHECK(FaceIndexEquals(mesh.indices[7], 2, -1, 1));
+  TEST_CHECK(FaceIndexEquals(mesh.indices[8], 3, -1, 0));
+
+  // Face 3: v/vt — only the normal is missing.
+  TEST_CHECK(FaceIndexEquals(mesh.indices[9], 0, 0, -1));
+  TEST_CHECK(FaceIndexEquals(mesh.indices[10], 1, 1, -1));
+  TEST_CHECK(FaceIndexEquals(mesh.indices[11], 3, 0, -1));
+
+  // All faces are triangles.
+  for (size_t f = 0; f < 4; f++) {
+    TEST_CHECK(mesh.num_face_vertices[f] == 3);
+  }
+
+  // Material attribution per triangle.
+  TEST_CHECK(mesh.material_ids[0] == 0);  // mat_a
+  TEST_CHECK(mesh.material_ids[1] == 0);  // mat_a
+  TEST_CHECK(mesh.material_ids[2] == 1);  // mat_b
+  TEST_CHECK(mesh.material_ids[3] == 1);  // mat_b
+
+  // Attribute correspondence: resolved indices point at the expected values.
+  TEST_CHECK(FloatEquals(attrib.texcoords[2 * 1 + 0], 1.0f));  // vt 2 u
+  TEST_CHECK(FloatEquals(attrib.normals[3 * 1 + 1], 1.0f));    // vn 2 y
+  TEST_CHECK(FloatEquals(attrib.vertices[3 * 3 + 1], 1.0f));   // v 4 y
+}
+
+// Relative (negative) indices must resolve against the attributes that exist
+// at the point each face is parsed — including attributes appended between
+// faces — while a vertex-only face in the same model must still produce the
+// -1 "not present" sentinel rather than resolving to the last attribute.
+void test_face_missing_attr_vs_negative_relative_index() {
+  const char *obj_text =
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "vt 0.0 0.0\n"
+      "vn 0.0 0.0 1.0\n"
+      "f -3/-1/-1 -2/-1/-1 -1/-1/-1\n"  // only vt0/vn0 exist here
+      "vt 1.0 0.0\n"                    // appended AFTER the first face
+      "vn 0.0 1.0 0.0\n"
+      "f -3/-2/-2 -2/-1/-1 -1/-2/-1\n"  // relative refs to old and new attrs
+      "f -3 -2 -1\n";                   // vertex-only: -1 sentinels expected
+
+  // Expected (vertex, texcoord, normal) triples.  Note that for the last
+  // face the -1 sentinel must NOT be resolved as relative index -1, which
+  // would select the LAST texcoord/normal (index 1 at that point).
+  static const int expected[9][3] = {
+      {0, 0, 0}, {1, 0, 0}, {2, 0, 0},          // face 0
+      {0, 0, 0}, {1, 1, 1}, {2, 0, 1},          // face 1
+      {0, -1, -1}, {1, -1, -1}, {2, -1, -1}};   // face 2: sentinels
+
+  // Legacy stream loader.
+  {
+    std::istringstream iss(obj_text);
+    tinyobj::attrib_t attrib;
+    std::vector<tinyobj::shape_t> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+    bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                                &iss, NULL);
+    TEST_CHECK(ret == true);
+    TEST_CHECK(attrib.texcoords.size() == 4);  // 2 texcoords
+    TEST_CHECK(attrib.normals.size() == 6);    // 2 normals
+    TEST_CHECK(shapes.size() == 1);
+    if (shapes.size() == 1) {
+      const std::vector<tinyobj::index_t> &idx = shapes[0].mesh.indices;
+      TEST_CHECK(idx.size() == 9);
+      TEST_CHECK(shapes[0].mesh.num_face_vertices.size() == 3);
+      if (idx.size() == 9) {
+        for (size_t i = 0; i < 9; i++) {
+          TEST_CHECK(FaceIndexEquals(idx[i], expected[i][0], expected[i][1],
+                                     expected[i][2]));
+        }
+      }
+    }
+  }
+
+  // Optimized buffer loader — identical expectations.
+  {
+    tinyobj::basic_attrib_t<> attrib;
+    std::vector<tinyobj::basic_shape_t<>> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+    tinyobj::OptLoadConfig config;
+    config.triangulate = true;
+    bool ret = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
+                                   obj_text, strlen(obj_text), config);
+    TEST_CHECK(ret == true);
+    TEST_CHECK(attrib.texcoords.size() == 4);
+    TEST_CHECK(attrib.normals.size() == 6);
+    TEST_CHECK(attrib.indices.size() == 9);
+    TEST_CHECK(attrib.face_num_verts.size() == 3);
+    if (attrib.indices.size() == 9) {
+      for (size_t i = 0; i < 9; i++) {
+        TEST_CHECK(FaceIndexEquals(attrib.indices[i], expected[i][0],
+                                   expected[i][1], expected[i][2]));
+      }
+    }
+  }
+}
+
+// Expected index layout of the mixed-attribute quad used by
+// test_face_missing_attr_quad_triangulation_toggle when triangulated.
+// The quad geometry makes the 0-2 diagonal the shorter one, so both loaders
+// must split it as [c0 c1 c2] [c0 c2 c3], preserving per-corner attributes.
+template <typename NumVertsT>
+static void CheckMixedQuadTriangulated(const tinyobj::index_t *idx, size_t n,
+                                       const std::vector<NumVertsT> &num_verts,
+                                       const std::vector<int> &mat_ids) {
+  TEST_CHECK(n == 6);
+  TEST_CHECK(num_verts.size() == 2);
+  TEST_CHECK(mat_ids.size() == 2);
+  if (n != 6 || num_verts.size() != 2 || mat_ids.size() != 2) return;
+
+  TEST_CHECK(FaceIndexEquals(idx[0], 0, 0, 0));
+  TEST_CHECK(FaceIndexEquals(idx[1], 1, 1, 0));
+  TEST_CHECK(FaceIndexEquals(idx[2], 2, -1, 1));   // texcoord missing
+  TEST_CHECK(FaceIndexEquals(idx[3], 0, 0, 0));
+  TEST_CHECK(FaceIndexEquals(idx[4], 2, -1, 1));   // texcoord missing
+  TEST_CHECK(FaceIndexEquals(idx[5], 3, -1, -1));  // texcoord+normal missing
+
+  TEST_CHECK(num_verts[0] == 3);
+  TEST_CHECK(num_verts[1] == 3);
+  // Both triangles inherit the quad's (unresolved) material id.
+  TEST_CHECK(mat_ids[0] == -1);
+  TEST_CHECK(mat_ids[1] == -1);
+}
+
+// Expected index layout of the same quad when triangulation is disabled:
+// the original corner order and per-corner attributes are preserved.
+template <typename NumVertsT>
+static void CheckMixedQuadUntriangulated(
+    const tinyobj::index_t *idx, size_t n,
+    const std::vector<NumVertsT> &num_verts, const std::vector<int> &mat_ids) {
+  TEST_CHECK(n == 4);
+  TEST_CHECK(num_verts.size() == 1);
+  TEST_CHECK(mat_ids.size() == 1);
+  if (n != 4 || num_verts.size() != 1 || mat_ids.size() != 1) return;
+
+  TEST_CHECK(FaceIndexEquals(idx[0], 0, 0, 0));
+  TEST_CHECK(FaceIndexEquals(idx[1], 1, 1, 0));
+  TEST_CHECK(FaceIndexEquals(idx[2], 2, -1, 1));   // texcoord missing
+  TEST_CHECK(FaceIndexEquals(idx[3], 3, -1, -1));  // texcoord+normal missing
+
+  TEST_CHECK(num_verts[0] == 4);
+  TEST_CHECK(mat_ids[0] == -1);
+}
+
+// A quad whose corners use different reference styles — full (v/vt/vn),
+// full, missing texcoord (v//vn), vertex-only (v) — loaded with triangulation
+// enabled and disabled through both the stream and buffer loaders.
+void test_face_missing_attr_quad_triangulation_toggle() {
+  const char *obj_text =
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 1.0 0.5 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "vt 0.0 0.0\n"
+      "vt 1.0 0.0\n"
+      "vn 0.0 0.0 1.0\n"
+      "vn 0.0 1.0 0.0\n"
+      "usemtl mat_a\n"
+      "f 1/1/1 2/2/1 3//2 4\n";
+
+  for (int tri = 0; tri < 2; tri++) {
+    // Legacy stream loader.
+    {
+      std::istringstream iss(obj_text);
+      tinyobj::attrib_t attrib;
+      std::vector<tinyobj::shape_t> shapes;
+      std::vector<tinyobj::material_t> materials;
+      std::string warn, err;
+      bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                                  &iss, NULL, tri == 0, false);
+      TEST_CHECK(ret == true);
+      TEST_CHECK(shapes.size() == 1);
+      if (shapes.size() == 1) {
+        const tinyobj::mesh_t &mesh = shapes[0].mesh;
+        const tinyobj::index_t *idx =
+            mesh.indices.empty() ? NULL : &mesh.indices[0];
+        if (tri == 0) {
+          CheckMixedQuadTriangulated(idx, mesh.indices.size(),
+                                     mesh.num_face_vertices,
+                                     mesh.material_ids);
+        } else {
+          CheckMixedQuadUntriangulated(idx, mesh.indices.size(),
+                                       mesh.num_face_vertices,
+                                       mesh.material_ids);
+        }
+      }
+    }
+
+    // Optimized buffer loader — identical expectations.
+    {
+      tinyobj::basic_attrib_t<> attrib;
+      std::vector<tinyobj::basic_shape_t<>> shapes;
+      std::vector<tinyobj::material_t> materials;
+      std::string warn, err;
+      tinyobj::OptLoadConfig config;
+      config.triangulate = (tri == 0);
+      bool ret = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
+                                     obj_text, strlen(obj_text), config);
+      TEST_CHECK(ret == true);
+      const tinyobj::index_t *idx =
+          attrib.indices.empty() ? NULL : &attrib.indices[0];
+      if (tri == 0) {
+        CheckMixedQuadTriangulated(idx, attrib.indices.size(),
+                                   attrib.face_num_verts,
+                                   attrib.material_ids);
+      } else {
+        CheckMixedQuadUntriangulated(idx, attrib.indices.size(),
+                                     attrib.face_num_verts,
+                                     attrib.material_ids);
+      }
+    }
+  }
+}
+
+// A model mixing every reference style plus a quad, loaded through the
+// legacy stream API and the optimized buffer API with triangulation both
+// enabled and disabled.  The flattened geometry must be identical.
+void test_face_missing_attr_loaders_agree() {
+  const char *obj_text =
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 1.0 0.5 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "vt 0.0 0.0\n"
+      "vt 1.0 0.0\n"
+      "vn 0.0 0.0 1.0\n"
+      "vn 0.0 1.0 0.0\n"
+      "usemtl mat_a\n"
+      "f 1/1/1 2/2/1 3/1/2\n"   // full
+      "f 2 3 4\n"               // vertex-only
+      "usemtl mat_b\n"
+      "f 1//2 3//2 4//1\n"      // texcoord missing
+      "f 1/1 2/2 4/1 3/2\n";    // quad, normals missing
+
+  for (int tri = 0; tri < 2; tri++) {
+    tinyobj::attrib_t leg_attrib;
+    std::vector<tinyobj::shape_t> leg_shapes;
+    std::vector<tinyobj::material_t> leg_materials;
+    std::string leg_warn, leg_err;
+    std::istringstream iss(obj_text);
+    bool leg_ret = tinyobj::LoadObj(&leg_attrib, &leg_shapes, &leg_materials,
+                                    &leg_warn, &leg_err, &iss, NULL,
+                                    tri == 0, false);
+    TEST_CHECK(leg_ret == true);
+
+    tinyobj::basic_attrib_t<> opt_attrib;
+    std::vector<tinyobj::basic_shape_t<>> opt_shapes;
+    std::vector<tinyobj::material_t> opt_materials;
+    std::string opt_warn, opt_err;
+    tinyobj::OptLoadConfig config;
+    config.triangulate = (tri == 0);
+    bool opt_ret = tinyobj::LoadObjOpt(&opt_attrib, &opt_shapes,
+                                       &opt_materials, &opt_warn, &opt_err,
+                                       obj_text, strlen(obj_text), config);
+    TEST_CHECK(opt_ret == true);
+
+    // Same attribute pools, same flattened indices, same per-face vertex
+    // counts and material ids.
+    TEST_CHECK(opt_test::LegacyAttribEqualsOpt(leg_attrib, leg_shapes,
+                                               opt_attrib));
+
+    const size_t expected_faces = (tri == 0) ? 5 : 4;
+    TEST_CHECK(opt_attrib.face_num_verts.size() == expected_faces);
+
+    if (tri == 0) {
+      // The quad (normals missing on all four corners) is split along the
+      // shorter 1-3 diagonal: [c0 c1 c3] [c1 c2 c3].
+      static const int quad_expected[6][3] = {
+          {0, 0, -1}, {1, 1, -1}, {2, 1, -1},
+          {1, 1, -1}, {3, 0, -1}, {2, 1, -1}};
+      TEST_CHECK(opt_attrib.indices.size() == 15);
+      if (opt_attrib.indices.size() == 15) {
+        for (size_t i = 0; i < 6; i++) {
+          TEST_CHECK(FaceIndexEquals(opt_attrib.indices[9 + i],
+                                     quad_expected[i][0],
+                                     quad_expected[i][1],
+                                     quad_expected[i][2]));
+        }
+      }
+    } else {
+      TEST_CHECK(opt_attrib.indices.size() == 13);
+      if (opt_attrib.face_num_verts.size() == 4) {
+        TEST_CHECK(opt_attrib.face_num_verts[3] == 4);
+      }
+    }
+  }
+}
+
+// An invalid relative reference adjacent to valid faces must fail loudly in
+// both loaders — the failure must not silently drop the bad face nor mask
+// the attribute mapping of the faces around it.  Both loaders must agree on
+// the failure and expose no partially accepted geometry past the boundary.
+void test_invalid_relative_face_between_valid_faces() {
+  // Invalid relative vertex index on line 6 (only 3 vertices exist).
+  const char *bad_vertex_obj =
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "vt 0.0 0.0\n"
+      "f 1/1 2/1 3/1\n"      // line 5: valid
+      "f -4/1 -2/1 -1/1\n"   // line 6: -4 is out of range
+      "f 1/1 3/1 2/1\n";     // line 7: valid
+  // Invalid relative texcoord index on line 6 (only 1 texcoord exists).
+  const char *bad_texcoord_obj =
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "vt 0.0 0.0\n"
+      "f 1/1 2/1 3/1\n"      // line 5: valid
+      "f -3/-2 -2/-1 -1/-1\n"  // line 6: texcoord -2 does not exist yet
+      "f 1/1 3/1 2/1\n";     // line 7: valid
+
+  const char *bad_models[2] = {bad_vertex_obj, bad_texcoord_obj};
+
+  for (size_t m = 0; m < 2; m++) {
+    for (int tri = 0; tri < 2; tri++) {
+      // Legacy stream loader.
+      {
+        tinyobj::attrib_t attrib;
+        std::vector<tinyobj::shape_t> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warn, err;
+        std::istringstream iss(bad_models[m]);
+        bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                                    &iss, NULL, tri == 0, false);
+        TEST_CHECK(ret == false);
+        TEST_CHECK(err.find("invalid vertex index") != std::string::npos);
+        TEST_CHECK(err.find(":6:") != std::string::npos);  // bad line
+        // No partially accepted geometry leaks past the failure boundary.
+        TEST_CHECK(attrib.vertices.empty());
+        TEST_CHECK(shapes.empty());
+      }
+
+      // Optimized buffer loader must agree on the failure boundary.
+      {
+        tinyobj::basic_attrib_t<> attrib;
+        std::vector<tinyobj::basic_shape_t<>> shapes;
+        std::vector<tinyobj::material_t> materials;
+        std::string warn, err;
+        tinyobj::OptLoadConfig config;
+        config.triangulate = (tri == 0);
+        bool ret = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn,
+                                       &err, bad_models[m],
+                                       strlen(bad_models[m]), config);
+        TEST_CHECK(ret == false);
+        TEST_CHECK(err.find("invalid vertex index") != std::string::npos);
+        TEST_CHECK(err.find("line 6") != std::string::npos);  // bad line
+        TEST_CHECK(attrib.indices.empty());
+        TEST_CHECK(shapes.empty());
+      }
+    }
+  }
+
+  // The same model with the bad face repaired (relative -3 is valid).  The
+  // face AFTER the formerly bad one must be observable with its exact
+  // attribute mapping in both loaders and both triangulation modes.
+  const char *fixed_obj =
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "vt 0.0 0.0\n"
+      "f 1/1 2/1 3/1\n"
+      "f -3/1 -2/1 -1/1\n"
+      "f 1/1 3/1 2/1\n";
+  static const int expected[9][3] = {
+      {0, 0, -1}, {1, 0, -1}, {2, 0, -1},  // f 1/1 2/1 3/1
+      {0, 0, -1}, {1, 0, -1}, {2, 0, -1},  // f -3/1 -2/1 -1/1
+      {0, 0, -1}, {2, 0, -1}, {1, 0, -1}};  // f 1/1 3/1 2/1 (reordered)
+
+  for (int tri = 0; tri < 2; tri++) {
+    // Legacy stream loader.
+    {
+      tinyobj::attrib_t attrib;
+      std::vector<tinyobj::shape_t> shapes;
+      std::vector<tinyobj::material_t> materials;
+      std::string warn, err;
+      std::istringstream iss(fixed_obj);
+      bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                                  &iss, NULL, tri == 0, false);
+      TEST_CHECK(ret == true);
+      std::vector<tinyobj::index_t> indices;
+      std::vector<int> num_face_vertices;
+      std::vector<int> material_ids;
+      FlattenLegacyMeshes(shapes, &indices, &num_face_vertices,
+                          &material_ids);
+      TEST_CHECK(indices.size() == 9);
+      TEST_CHECK(num_face_vertices.size() == 3);
+      TEST_CHECK(material_ids.size() == 3);
+      if (indices.size() == 9) {
+        for (size_t i = 0; i < 9; i++) {
+          TEST_CHECK(FaceIndexEquals(indices[i], expected[i][0],
+                                     expected[i][1], expected[i][2]));
+        }
+      }
+      if (material_ids.size() == 3) {
+        TEST_CHECK(material_ids[0] == -1);
+        TEST_CHECK(material_ids[1] == -1);
+        TEST_CHECK(material_ids[2] == -1);
+      }
+    }
+
+    // Optimized buffer loader.
+    {
+      tinyobj::basic_attrib_t<> attrib;
+      std::vector<tinyobj::basic_shape_t<>> shapes;
+      std::vector<tinyobj::material_t> materials;
+      std::string warn, err;
+      tinyobj::OptLoadConfig config;
+      config.triangulate = (tri == 0);
+      bool ret = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
+                                     fixed_obj, strlen(fixed_obj), config);
+      TEST_CHECK(ret == true);
+      TEST_CHECK(attrib.indices.size() == 9);
+      TEST_CHECK(attrib.face_num_verts.size() == 3);
+      TEST_CHECK(attrib.material_ids.size() == 3);
+      if (attrib.indices.size() == 9) {
+        for (size_t i = 0; i < 9; i++) {
+          TEST_CHECK(FaceIndexEquals(attrib.indices[i], expected[i][0],
+                                     expected[i][1], expected[i][2]));
+        }
+      }
+      if (attrib.material_ids.size() == 3) {
+        TEST_CHECK(attrib.material_ids[0] == -1);
+        TEST_CHECK(attrib.material_ids[1] == -1);
+        TEST_CHECK(attrib.material_ids[2] == -1);
+      }
+    }
+  }
+}
+
+// Material attribution and missing-attribute sentinels through the
+// file-based loading paths (LoadObjOpt file API and legacy LoadObj file
+// API), with a real .mtl file on disk.
+void test_loadobjopt_file_missing_attr_material_ids() {
+#ifdef _WIN32
+  std::string test_dir;
+  wchar_t wtmpbuf[MAX_PATH];
+  GetTempPathW(MAX_PATH, wtmpbuf);
+  test_dir = WcharToUTF8(wtmpbuf) + "tinyobj_opt_missing_attr\\";
+#else
+  std::string test_dir = "/tmp/tinyobj_opt_missing_attr/";
+#endif
+
+  RemoveTestDir(test_dir);
+  TEST_CHECK(MakeDir(test_dir));
+
+  const std::string obj_path = test_dir + "scene.obj";
+  const std::string mtl_path = test_dir + "scene.mtl";
+  const std::string obj_text =
+      "mtllib scene.mtl\n"
+      "v 0.0 0.0 0.0\n"
+      "v 1.0 0.0 0.0\n"
+      "v 1.0 1.0 0.0\n"
+      "v 0.0 1.0 0.0\n"
+      "vt 0.0 0.0\n"
+      "vt 1.0 0.0\n"
+      "vn 0.0 0.0 1.0\n"
+      "vn 0.0 1.0 0.0\n"
+      "usemtl mat_a\n"
+      "f 1/1/1 2/2/1 3/1/2\n"  // full
+      "f 2 3 4\n"              // vertex-only
+      "usemtl mat_b\n"
+      "f 1//2 3//2 4//1\n";    // texcoord missing
+  const std::string mtl_text =
+      "newmtl mat_a\n"
+      "Kd 1.0 0.0 0.0\n"
+      "newmtl mat_b\n"
+      "Kd 0.0 1.0 0.0\n";
+
+  TEST_CHECK(opt_test::WriteTextFile(obj_path, obj_text));
+  TEST_CHECK(opt_test::WriteTextFile(mtl_path, mtl_text));
+
+  static const int expected[9][3] = {
+      {0, 0, 0}, {1, 1, 0}, {2, 0, 1},          // face 0: full
+      {1, -1, -1}, {2, -1, -1}, {3, -1, -1},    // face 1: vertex-only
+      {0, -1, 1}, {2, -1, 1}, {3, -1, 0}};      // face 2: texcoord missing
+
+  for (int tri = 0; tri < 2; tri++) {
+    tinyobj::basic_attrib_t<> attrib;
+    std::vector<tinyobj::basic_shape_t<>> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+    tinyobj::OptLoadConfig config;
+    config.num_threads = 1;
+    config.triangulate = (tri == 0);
+
+    bool ret = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
+                                   obj_path.c_str(),
+                                   static_cast<const char *>(NULL), config);
+    TEST_CHECK(ret == true);
+    TEST_CHECK(materials.size() == 2);
+    TEST_CHECK(attrib.indices.size() == 9);
+    TEST_CHECK(attrib.face_num_verts.size() == 3);
+    TEST_CHECK(attrib.material_ids.size() == 3);
+    if (attrib.indices.size() == 9) {
+      for (size_t i = 0; i < 9; i++) {
+        TEST_CHECK(FaceIndexEquals(attrib.indices[i], expected[i][0],
+                                   expected[i][1], expected[i][2]));
+      }
+    }
+    if (attrib.material_ids.size() == 3) {
+      TEST_CHECK(attrib.material_ids[0] == 0);  // mat_a
+      TEST_CHECK(attrib.material_ids[1] == 0);  // mat_a
+      TEST_CHECK(attrib.material_ids[2] == 1);  // mat_b
+    }
+
+    // The legacy file loader must agree on the same files.
+    tinyobj::attrib_t leg_attrib;
+    std::vector<tinyobj::shape_t> leg_shapes;
+    std::vector<tinyobj::material_t> leg_materials;
+    std::string leg_warn, leg_err;
+    bool leg_ret = tinyobj::LoadObj(&leg_attrib, &leg_shapes, &leg_materials,
+                                    &leg_warn, &leg_err, obj_path.c_str(),
+                                    test_dir.c_str(), tri == 0, false);
+    TEST_CHECK(leg_ret == true);
+    TEST_CHECK(opt_test::LegacyAttribEqualsOpt(leg_attrib, leg_shapes,
+                                               attrib));
+    TEST_CHECK(opt_test::LegacyMaterialsEqualOpt(leg_materials, materials));
+  }
+
+  RemoveTestDir(test_dir);
+}
+
 TEST_LIST = {
     {"cornell_box", test_cornell_box},
     {"catmark_torus_creases0", test_catmark_torus_creases0},
@@ -4505,4 +5139,15 @@ TEST_LIST = {
      test_loadobjopt_object_name_trimming},
     {"test_loadobjopt_mixed_line_endings",
      test_loadobjopt_mixed_line_endings},
+    {"face_missing_attr_mixed_full_and_vertex_only",
+     test_face_missing_attr_mixed_full_and_vertex_only},
+    {"face_missing_attr_vs_negative_relative_index",
+     test_face_missing_attr_vs_negative_relative_index},
+    {"face_missing_attr_quad_triangulation_toggle",
+     test_face_missing_attr_quad_triangulation_toggle},
+    {"face_missing_attr_loaders_agree", test_face_missing_attr_loaders_agree},
+    {"invalid_relative_face_between_valid_faces",
+     test_invalid_relative_face_between_valid_faces},
+    {"loadobjopt_file_missing_attr_material_ids",
+     test_loadobjopt_file_missing_attr_material_ids},
     {NULL, NULL}};
