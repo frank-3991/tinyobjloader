@@ -483,6 +483,19 @@ static bool CopyTestFile(const std::string& src, const std::string& dst) {
   return !out.fail();
 }
 
+// Writes `contents` to `path` in binary mode. Used by tests that build small
+// .obj/.mtl trees on disk to exercise material/library path resolution.
+static bool WriteTestFile(const std::string& path, const std::string& contents) {
+#ifdef _WIN32
+  std::ofstream out(LongPathW(UTF8ToWchar(path)).c_str(), std::ios::binary);
+#else
+  std::ofstream out(path.c_str(), std::ios::binary);
+#endif
+  if (!out) return false;
+  out.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+  return !out.fail();
+}
+
 #ifdef _WIN32
 // Returns true if Windows has the system-wide long path support enabled
 // (HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 1).
@@ -1524,6 +1537,283 @@ void test_mtl_searchpaths_issue244() {
   TEST_CHECK(4 == shapes[1].mesh.indices[0].vertex_index);
 }
 
+// ---------------------------------------------------------------------------
+// Per-model material-library origin and texture path resolution
+//
+// Several .obj files can each name a same-named .mtl (`scene.mtl`) while
+// living in different folders, and each copy of that .mtl can reference
+// different (also same-named) textures relative to its own directory.
+// `material_t::texpath` records the directory of the .mtl that actually
+// defined the material, and `ResolveTexPath()` turns a texture name from that
+// material into a path next to the same .mtl. Material names themselves keep
+// their historical first-definition-wins semantics inside a single load.
+// ---------------------------------------------------------------------------
+
+static std::string MakeTestDirPath(const std::string& base,
+                                   const std::string& name) {
+#ifdef _WIN32
+  return base + name + "\\";
+#else
+  return base + name + "/";
+#endif
+}
+
+// Two models in sibling directories, each with its own copy of "scene.mtl"
+// that references a distinct texture. Each load must attribute the texture to
+// its own library directory; neither load may influence the other.
+void test_material_origin_isolated_between_models() {
+#ifdef _WIN32
+  std::string base;
+  {
+    wchar_t wtmpbuf[MAX_PATH];
+    GetTempPathW(MAX_PATH, wtmpbuf);
+    base = WcharToUTF8(wtmpbuf);
+  }
+#else
+  std::string base = "/tmp/";
+#endif
+  std::string root = MakeTestDirPath(base, "tinyobj_mat_origin_test");
+  std::string dir_a = MakeTestDirPath(root, "modelA");
+  std::string dir_b = MakeTestDirPath(root, "modelB");
+
+  if (!MakeDir(root) || !MakeDir(dir_a) || !MakeDir(dir_b)) {
+    RemoveTestDir(root);
+    std::cout << "SKIPPED: cannot create temp dirs for material origin test\n";
+    return;
+  }
+
+  const std::string obj_body =
+      "v 0 0 0\n"
+      "v 1 0 0\n"
+      "v 0 1 0\n"
+      "usemtl shared\n"
+      "f 1 2 3\n";
+
+  bool wrote = WriteTestFile(dir_a + "scene.mtl",
+                             "newmtl shared\n"
+                             "Kd 1 0 0\n"
+                             "map_Kd a_diffuse.png\n") &&
+               WriteTestFile(dir_b + "scene.mtl",
+                             "newmtl shared\n"
+                             "Kd 0 0 1\n"
+                             "map_Kd b_diffuse.png\n") &&
+               WriteTestFile(dir_a + "modelA.obj",
+                             "mtllib scene.mtl\n" + obj_body) &&
+               WriteTestFile(dir_b + "modelB.obj",
+                             "mtllib scene.mtl\n" + obj_body);
+  if (!wrote) {
+    RemoveTestDir(root);
+    TEST_CHECK_(false, "failed to write material origin test files");
+    return;
+  }
+
+  tinyobj::attrib_t attrib_a, attrib_b;
+  std::vector<tinyobj::shape_t> shapes_a, shapes_b;
+  std::vector<tinyobj::material_t> mats_a, mats_b;
+  std::string warn_a, warn_b, err_a, err_b;
+
+  bool ok_a = tinyobj::LoadObj(&attrib_a, &shapes_a, &mats_a, &warn_a, &err_a,
+                               (dir_a + "modelA.obj").c_str(), dir_a.c_str());
+  bool ok_b = tinyobj::LoadObj(&attrib_b, &shapes_b, &mats_b, &warn_b, &err_b,
+                               (dir_b + "modelB.obj").c_str(), dir_b.c_str());
+
+  RemoveTestDir(root);
+
+  TEST_CHECK(ok_a == true);
+  TEST_CHECK(ok_b == true);
+  TEST_CHECK(mats_a.size() == 1);
+  TEST_CHECK(mats_b.size() == 1);
+  if (mats_a.size() != 1 || mats_b.size() != 1) return;
+
+  // Both libraries define a material called "shared"; each model keeps its
+  // own copy, defined by its own library, and the face binds to material 0.
+  TEST_CHECK(mats_a[0].name == "shared");
+  TEST_CHECK(mats_b[0].name == "shared");
+  TEST_CHECK(FloatEquals(1.0f, mats_a[0].diffuse[0]));
+  TEST_CHECK(FloatEquals(0.0f, mats_a[0].diffuse[2]));
+  TEST_CHECK(FloatEquals(0.0f, mats_b[0].diffuse[0]));
+  TEST_CHECK(FloatEquals(1.0f, mats_b[0].diffuse[2]));
+  TEST_CHECK(shapes_a[0].mesh.material_ids[0] == 0);
+  TEST_CHECK(shapes_b[0].mesh.material_ids[0] == 0);
+
+  // The texture name is stored verbatim (backwards compatible with existing
+  // callers)...
+  TEST_CHECK(mats_a[0].diffuse_texname == "a_diffuse.png");
+  TEST_CHECK(mats_b[0].diffuse_texname == "b_diffuse.png");
+
+  // ...while `texpath` and `ResolveTexPath()` identify the library origin.
+  TEST_CHECK(mats_a[0].texpath == dir_a);
+  TEST_CHECK(mats_b[0].texpath == dir_b);
+
+  std::string resolved_a =
+      tinyobj::ResolveTexPath(mats_a[0].diffuse_texname, mats_a[0]);
+  std::string resolved_b =
+      tinyobj::ResolveTexPath(mats_b[0].diffuse_texname, mats_b[0]);
+  TEST_CHECK(resolved_a == dir_a + "a_diffuse.png");
+  TEST_CHECK(resolved_b == dir_b + "b_diffuse.png");
+
+  // No cross-contamination: model A's path must never contain B's directory
+  // suffix and vice versa.
+  TEST_CHECK(resolved_a.find("modelB") == std::string::npos);
+  TEST_CHECK(resolved_b.find("modelA") == std::string::npos);
+}
+
+// A single search path with several folders: the first folder that actually
+// contains an openable .mtl wins (existing priority order), and the texture
+// origin follows the winning copy, not the .obj's own directory.
+void test_material_search_priority_preserved_with_texpath() {
+#ifdef _WIN32
+  std::string base;
+  {
+    wchar_t wtmpbuf[MAX_PATH];
+    GetTempPathW(MAX_PATH, wtmpbuf);
+    base = WcharToUTF8(wtmpbuf);
+  }
+  const char sep = ';';
+#else
+  std::string base = "/tmp/";
+  const char sep = ':';
+#endif
+  std::string root = MakeTestDirPath(base, "tinyobj_mat_priority_test");
+  // The object lives in `objdir`, the only library copy lives in `libdir`; a
+  // third folder (`missingdir`) has nothing, and must be skipped silently.
+  std::string objdir = MakeTestDirPath(root, "objdir");
+  std::string libdir = MakeTestDirPath(root, "libdir");
+  std::string missingdir = MakeTestDirPath(root, "missingdir");
+
+  if (!MakeDir(root) || !MakeDir(objdir) || !MakeDir(libdir) ||
+      !MakeDir(missingdir)) {
+    RemoveTestDir(root);
+    std::cout << "SKIPPED: cannot create temp dirs for search priority test\n";
+    return;
+  }
+
+  bool wrote =
+      WriteTestFile(libdir + "prio.mtl",
+                    "newmtl only_in_libdir\n"
+                    "Kd 0 1 0\n"
+                    "map_Kd tex_in_libdir.png\n") &&
+      WriteTestFile(objdir + "model.obj",
+                    "mtllib prio.mtl\n"
+                    "v 0 0 0\n"
+                    "v 1 0 0\n"
+                    "v 0 1 0\n"
+                    "usemtl only_in_libdir\n"
+                    "f 1 2 3\n");
+  if (!wrote) {
+    RemoveTestDir(root);
+    TEST_CHECK_(false, "failed to write search priority test files");
+    return;
+  }
+
+  std::string search_paths;
+  search_paths += missingdir;
+  search_paths += sep;
+  search_paths += libdir;
+
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                              (objdir + "model.obj").c_str(),
+                              search_paths.c_str());
+
+  RemoveTestDir(root);
+
+  TEST_CHECK(ret == true);
+  TEST_CHECK(materials.size() == 1);
+  if (materials.size() != 1) return;
+
+  TEST_CHECK(materials[0].name == "only_in_libdir");
+  TEST_CHECK(shapes[0].mesh.material_ids[0] == 0);
+  TEST_CHECK(materials[0].diffuse_texname == "tex_in_libdir.png");
+  // The texture belongs to the folder the .mtl was found in, not to `objdir`
+  // nor to the empty earlier search entry.
+  TEST_CHECK(materials[0].texpath == libdir);
+  TEST_CHECK(tinyobj::ResolveTexPath(materials[0].diffuse_texname,
+                                     materials[0]) ==
+             libdir + "tex_in_libdir.png");
+}
+
+// A damaged library must not disturb already-loaded, valid materials, and the
+// historical fallback semantics (warn, keep going, default material for faces
+// that reference nothing) stay intact.
+void test_material_failed_library_keeps_valid_references() {
+#ifdef _WIN32
+  std::string base;
+  {
+    wchar_t wtmpbuf[MAX_PATH];
+    GetTempPathW(MAX_PATH, wtmpbuf);
+    base = WcharToUTF8(wtmpbuf);
+  }
+#else
+  std::string base = "/tmp/";
+#endif
+  std::string root = MakeTestDirPath(base, "tinyobj_mat_breakage_test");
+  std::string objdir = MakeTestDirPath(root, "objdir");
+  std::string libdir = MakeTestDirPath(root, "libdir");
+
+  if (!MakeDir(root) || !MakeDir(objdir) || !MakeDir(libdir)) {
+    RemoveTestDir(root);
+    std::cout << "SKIPPED: cannot create temp dirs for breakage test\n";
+    return;
+  }
+
+  bool wrote =
+      WriteTestFile(libdir + "good.mtl",
+                    "newmtl good\n"
+                    "Kd 1 1 1\n"
+                    "map_Kd good.png\n") &&
+      // Present but unparsable: the library opens, then fails mid-file.
+      WriteTestFile(libdir + "corrupt.mtl",
+                    "newmtl corrupt\n"
+                    "Kd 0 0 0\n"
+                    "Kd not a number\n") &&
+      WriteTestFile(objdir + "model.obj",
+                    "mtllib broken.mtl corrupt.mtl good.mtl\n"
+                    "v 0 0 0\n"
+                    "v 1 0 0\n"
+                    "v 0 1 0\n"
+                    "usemtl good\n"
+                    "f 1 2 3\n"
+                    "usemtl never_defined\n"
+                    "f 1 2 3\n");
+  if (!wrote) {
+    RemoveTestDir(root);
+    TEST_CHECK_(false, "failed to write breakage test files");
+    return;
+  }
+
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                              (objdir + "model.obj").c_str(), libdir.c_str());
+
+  RemoveTestDir(root);
+
+  TEST_CHECK(ret == true);
+  TEST_CHECK(materials.size() == 1);
+  if (materials.size() != 1) return;
+
+  TEST_CHECK(materials[0].name == "good");
+  TEST_CHECK(materials[0].diffuse_texname == "good.png");
+  TEST_CHECK(materials[0].texpath == libdir);
+  TEST_CHECK(tinyobj::ResolveTexPath(materials[0].diffuse_texname,
+                                     materials[0]) ==
+             libdir + "good.png");
+
+  // The missing library still produces the historical warning...
+  TEST_CHECK(warn.find("broken.mtl") != std::string::npos);
+  // ...the valid material still binds to the first face...
+  TEST_CHECK(shapes[0].mesh.material_ids[0] == 0);
+  // ...and the unknown `usemtl` falls back to the default material id (-1)
+  // exactly as before.
+  TEST_CHECK(shapes[0].mesh.material_ids[1] == -1);
+}
+
 void test_usemtl_whitespace_issue246() {
   tinyobj::attrib_t attrib;
   std::vector<tinyobj::shape_t> shapes;
@@ -1603,6 +1893,379 @@ void test_mtl_filename_with_whitespace_issue46() {
   TEST_CHECK(1 == materials.size());
   TEST_CHECK("green" == materials[0].name);
 }
+
+// Library and texture names that contain spaces must survive path resolution
+// unchanged: the escaping rules apply to the `mtllib` token list only, and the
+// resolved texture path is a plain join with the library directory.
+void test_material_origin_with_whitespace_paths() {
+#ifdef _WIN32
+  std::string base;
+  {
+    wchar_t wtmpbuf[MAX_PATH];
+    GetTempPathW(MAX_PATH, wtmpbuf);
+    base = WcharToUTF8(wtmpbuf);
+  }
+#else
+  std::string base = "/tmp/";
+#endif
+  std::string root = MakeTestDirPath(base, "tinyobj_mat_space_test");
+  std::string libdir = MakeTestDirPath(root, "texture library");
+
+  if (!MakeDir(root) || !MakeDir(libdir)) {
+    RemoveTestDir(root);
+    std::cout << "SKIPPED: cannot create temp dirs for whitespace path test\n";
+    return;
+  }
+
+  bool wrote =
+      WriteTestFile(libdir + "shared scene.mtl",
+                    "newmtl shared\n"
+                    "Kd 1 1 1\n"
+                    "map_Kd base colour 01.png\n") &&
+      WriteTestFile(root + "model.obj",
+                    "mtllib shared\\ scene.mtl\n"
+                    "v 0 0 0\n"
+                    "v 1 0 0\n"
+                    "v 0 1 0\n"
+                    "usemtl shared\n"
+                    "f 1 2 3\n");
+  if (!wrote) {
+    RemoveTestDir(root);
+    TEST_CHECK_(false, "failed to write whitespace path test files");
+    return;
+  }
+
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                              (root + "model.obj").c_str(), libdir.c_str());
+
+  RemoveTestDir(root);
+
+  TEST_CHECK(ret == true);
+  TEST_CHECK(materials.size() == 1);
+  if (materials.size() != 1) return;
+
+  TEST_CHECK(materials[0].name == "shared");
+  TEST_CHECK(materials[0].diffuse_texname == "base colour 01.png");
+  TEST_CHECK(materials[0].texpath == libdir);
+  TEST_CHECK(tinyobj::ResolveTexPath(materials[0].diffuse_texname,
+                                     materials[0]) ==
+             libdir + "base colour 01.png");
+}
+
+// Two libraries in one load that both define "shared": the first definition
+// wins for `usemtl` (historical behaviour), while the second library's copy is
+// still kept with its own origin so no data is silently merged.
+void test_material_same_name_across_libraries_in_one_load() {
+#ifdef _WIN32
+  std::string base;
+  {
+    wchar_t wtmpbuf[MAX_PATH];
+    GetTempPathW(MAX_PATH, wtmpbuf);
+    base = WcharToUTF8(wtmpbuf);
+  }
+#else
+  std::string base = "/tmp/";
+#endif
+  std::string root = MakeTestDirPath(base, "tinyobj_mat_dupname_test");
+  std::string objdir = MakeTestDirPath(root, "objdir");
+  std::string libdir_b = MakeTestDirPath(root, "libB");
+
+  if (!MakeDir(root) || !MakeDir(objdir) || !MakeDir(libdir_b)) {
+    RemoveTestDir(root);
+    std::cout << "SKIPPED: cannot create temp dirs for duplicate-name test\n";
+    return;
+  }
+  bool wrote = WriteTestFile(objdir + "shared.mtl",
+                             "newmtl shared\n"
+                             "Kd 1 0 0\n"
+                             "map_Kd from_obj.png\n") &&
+               WriteTestFile(libdir_b + "other.mtl",
+                             "newmtl shared\n"
+                             "Kd 0 0 1\n"
+                             "map_Kd from_other.png\n") &&
+               WriteTestFile(objdir + "model.obj",
+                             // Separate lines: each is loaded. (Filenames on
+                             // one line are fallback alternatives, per issue
+                             // 112, so both would not be read that way.)
+                             "mtllib shared.mtl\n"
+                             "mtllib other.mtl\n"
+                             "v 0 0 0\n"
+                             "v 1 0 0\n"
+                             "v 0 1 0\n"
+                             "usemtl shared\n"
+                             "f 1 2 3\n");
+  if (!wrote) {
+    RemoveTestDir(root);
+    TEST_CHECK_(false, "failed to write duplicate-name test files");
+    return;
+  }
+
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  // Search both the object's own directory and libB.
+  std::string search_paths;
+  search_paths += objdir;
+#ifdef _WIN32
+  search_paths += ';';
+#else
+  search_paths += ':';
+#endif
+  search_paths += libdir_b;
+  bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                              (objdir + "model.obj").c_str(),
+                              search_paths.c_str());
+
+  RemoveTestDir(root);
+
+  TEST_CHECK(ret == true);
+  // Both definitions are materialized; the second is not discarded.
+  TEST_CHECK(materials.size() == 2);
+  if (materials.size() != 2) return;
+
+  TEST_CHECK(materials[0].name == "shared");
+  TEST_CHECK(materials[0].diffuse_texname == "from_obj.png");
+  TEST_CHECK(materials[0].texpath == objdir);
+  TEST_CHECK(materials[1].name == "shared");
+  TEST_CHECK(materials[1].diffuse_texname == "from_other.png");
+  TEST_CHECK(materials[1].texpath == libdir_b);
+
+  // `usemtl shared` binds to the first definition, as before.
+  TEST_CHECK(shapes[0].mesh.material_ids[0] == 0);
+  TEST_CHECK(tinyobj::ResolveTexPath(materials[0].diffuse_texname,
+                                     materials[0]) ==
+             objdir + "from_obj.png");
+  TEST_CHECK(tinyobj::ResolveTexPath(materials[1].diffuse_texname,
+                                     materials[1]) ==
+             libdir_b + "from_other.png");
+}
+
+// Repeating the same `mtllib` line must not re-read the library or duplicate
+// materials; the face-to-material mapping stays stable. Each distinct library
+// seen in one load keeps its own origin.
+void test_material_origin_duplicate_references_stable() {
+#ifdef _WIN32
+  std::string base;
+  {
+    wchar_t wtmpbuf[MAX_PATH];
+    GetTempPathW(MAX_PATH, wtmpbuf);
+    base = WcharToUTF8(wtmpbuf);
+  }
+  const char sep = ';';
+#else
+  std::string base = "/tmp/";
+  const char sep = ':';
+#endif
+  std::string root = MakeTestDirPath(base, "tinyobj_mat_dup_test");
+  std::string dir_one = MakeTestDirPath(root, "one");
+  std::string dir_two = MakeTestDirPath(root, "two");
+
+  if (!MakeDir(root) || !MakeDir(dir_one) || !MakeDir(dir_two)) {
+    RemoveTestDir(root);
+    std::cout << "SKIPPED: cannot create temp dirs for duplicate test\n";
+    return;
+  }
+
+  bool wrote =
+      WriteTestFile(dir_one + "one.mtl",
+                    "newmtl mat_one\n"
+                    "Kd 1 0 0\n"
+                    "map_Kd one.png\n") &&
+      WriteTestFile(dir_two + "two.mtl",
+                    "newmtl mat_two\n"
+                    "Kd 0 0 1\n"
+                    "map_Kd two.png\n") &&
+      WriteTestFile(root + "model.obj",
+                    "mtllib one.mtl\n"
+                    "mtllib two.mtl\n"
+                    "mtllib one.mtl\n"  // repeated reference
+                    "mtllib two.mtl\n"  // repeated reference
+                    "v 0 0 0\n"
+                    "v 1 0 0\n"
+                    "v 0 1 0\n"
+                    "usemtl mat_one\n"
+                    "f 1 2 3\n"
+                    "usemtl mat_two\n"
+                    "f 1 2 3\n"
+                    "usemtl mat_one\n"
+                    "f 1 2 3\n");
+  if (!wrote) {
+    RemoveTestDir(root);
+    TEST_CHECK_(false, "failed to write duplicate test files");
+    return;
+  }
+
+  std::string search_paths;
+  search_paths += dir_one;
+  search_paths += sep;
+  search_paths += dir_two;
+
+  tinyobj::attrib_t attrib;
+  std::vector<tinyobj::shape_t> shapes;
+  std::vector<tinyobj::material_t> materials;
+  std::string warn, err;
+  bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                              (root + "model.obj").c_str(),
+                              search_paths.c_str());
+
+  RemoveTestDir(root);
+
+  TEST_CHECK(ret == true);
+  // Two distinct libraries, each defined once, in load order.
+  TEST_CHECK(materials.size() == 2);
+  if (materials.size() != 2) return;
+
+  TEST_CHECK(materials[0].name == "mat_one");
+  TEST_CHECK(materials[0].texpath == dir_one);
+  TEST_CHECK(tinyobj::ResolveTexPath(materials[0].diffuse_texname,
+                                     materials[0]) ==
+             dir_one + "one.png");
+  TEST_CHECK(materials[1].name == "mat_two");
+  TEST_CHECK(materials[1].texpath == dir_two);
+  TEST_CHECK(tinyobj::ResolveTexPath(materials[1].diffuse_texname,
+                                     materials[1]) ==
+             dir_two + "two.png");
+
+  // Face-to-material mapping is stable across the repeated references.
+  TEST_CHECK(shapes[0].mesh.material_ids.size() == 3);
+  TEST_CHECK(shapes[0].mesh.material_ids[0] == 0);
+  TEST_CHECK(shapes[0].mesh.material_ids[1] == 1);
+  TEST_CHECK(shapes[0].mesh.material_ids[2] == 0);
+}
+
+// Reusing one `ObjReader` (and one output material vector) for several models
+// must not accumulate the earlier model's materials or texture origins.
+void test_material_origin_not_leaked_across_reloads() {
+#ifdef _WIN32
+  std::string base;
+  {
+    wchar_t wtmpbuf[MAX_PATH];
+    GetTempPathW(MAX_PATH, wtmpbuf);
+    base = WcharToUTF8(wtmpbuf);
+  }
+#else
+  std::string base = "/tmp/";
+#endif
+  std::string root = MakeTestDirPath(base, "tinyobj_mat_reload_test");
+  std::string dir_a = MakeTestDirPath(root, "modelA");
+  std::string dir_b = MakeTestDirPath(root, "modelB");
+
+  if (!MakeDir(root) || !MakeDir(dir_a) || !MakeDir(dir_b)) {
+    RemoveTestDir(root);
+    std::cout << "SKIPPED: cannot create temp dirs for reload test\n";
+    return;
+  }
+
+  const std::string obj_body =
+      "v 0 0 0\n"
+      "v 1 0 0\n"
+      "v 0 1 0\n"
+      "usemtl shared\n"
+      "f 1 2 3\n";
+
+  bool wrote = WriteTestFile(dir_a + "scene.mtl",
+                             "newmtl shared\n"
+                             "Kd 1 0 0\n"
+                             "map_Kd a.png\n") &&
+               WriteTestFile(dir_b + "scene.mtl",
+                             "newmtl shared\n"
+                             "Kd 0 1 0\n"
+                             "map_Kd b.png\n") &&
+               WriteTestFile(dir_a + "model.obj", "mtllib scene.mtl\n" +
+                                                      obj_body) &&
+               WriteTestFile(dir_b + "model.obj", "mtllib scene.mtl\n" +
+                                                      obj_body);
+  if (!wrote) {
+    RemoveTestDir(root);
+    TEST_CHECK_(false, "failed to write reload test files");
+    return;
+  }
+
+  // (a) ObjReader reused across two parses.
+  {
+    tinyobj::ObjReader reader;
+    tinyobj::ObjReaderConfig cfg;
+    TEST_CHECK(reader.ParseFromFile(dir_a + "model.obj", cfg) == true);
+    TEST_CHECK(reader.GetMaterials().size() == 1);
+    if (reader.GetMaterials().size() == 1) {
+      TEST_CHECK(reader.GetMaterials()[0].texpath == dir_a);
+    }
+    TEST_CHECK(reader.ParseFromFile(dir_b + "model.obj", cfg) == true);
+    TEST_CHECK(reader.GetMaterials().size() == 1);
+    if (reader.GetMaterials().size() == 1) {
+      TEST_CHECK(reader.GetMaterials()[0].texpath == dir_b);
+      TEST_CHECK(tinyobj::ResolveTexPath(reader.GetMaterials()[0].diffuse_texname,
+                                         reader.GetMaterials()[0]) ==
+                 dir_b + "b.png");
+    }
+    TEST_CHECK(reader.GetShapes().size() == 1);
+    if (reader.GetShapes().size() == 1) {
+      TEST_CHECK(reader.GetShapes()[0].mesh.material_ids[0] == 0);
+    }
+  }
+
+  // (b) A caller-owned materials vector passed to LoadObj twice.
+  {
+    tinyobj::attrib_t attrib;
+    std::vector<tinyobj::shape_t> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+    TEST_CHECK(tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                                (dir_a + "model.obj").c_str(),
+                                dir_a.c_str()) == true);
+    TEST_CHECK(materials.size() == 1);
+    TEST_CHECK(tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
+                                (dir_b + "model.obj").c_str(),
+                                dir_b.c_str()) == true);
+    TEST_CHECK(materials.size() == 1);
+    if (materials.size() == 1) {
+      TEST_CHECK(materials[0].texpath == dir_b);
+      TEST_CHECK(tinyobj::ResolveTexPath(materials[0].diffuse_texname,
+                                         materials[0]) == dir_b + "b.png");
+    }
+    TEST_CHECK(shapes.size() == 1);
+    if (shapes.size() == 1) {
+      TEST_CHECK(shapes[0].mesh.material_ids[0] == 0);
+    }
+  }
+
+  RemoveTestDir(root);
+}
+
+// `ResolveTexPath()` edge cases: empty names, absolute names and the empty
+// texpath used by stream input must all be pass-through.
+void test_resolve_texpath_edge_cases() {
+  tinyobj::material_t mat;  // default-constructed: texpath is empty
+  TEST_CHECK(tinyobj::ResolveTexPath("keep.png", mat) == "keep.png");
+  TEST_CHECK(tinyobj::ResolveTexPath("", mat) == "");
+
+  mat.texpath = "libs/";
+  TEST_CHECK(tinyobj::ResolveTexPath("keep.png", mat) == "libs/keep.png");
+  TEST_CHECK(tinyobj::ResolveTexPath("", mat) == "");
+  TEST_CHECK(tinyobj::ResolveTexPath("/abs/tex.png", mat) ==
+             "/abs/tex.png");
+
+  mat.texpath = "libs";  // no trailing separator
+  TEST_CHECK(tinyobj::ResolveTexPath("keep.png", mat) == "libs/keep.png");
+
+  // Dir-qualified texture names are resolved against the library too.
+  mat.texpath = "libs/";
+  TEST_CHECK(tinyobj::ResolveTexPath("sub/keep.png", mat) ==
+             "libs/sub/keep.png");
+
+#ifdef _WIN32
+  // Windows absolute forms: drive letter and UNC.
+  TEST_CHECK(tinyobj::ResolveTexPath("C:/tex.png", mat) == "C:/tex.png");
+  TEST_CHECK(tinyobj::ResolveTexPath("\\\\server\\share\\tex.png", mat) ==
+             "\\\\server\\share\\tex.png");
+#endif
+}
+
 
 void test_face_missing_issue295() {
   tinyobj::attrib_t attrib;
@@ -3419,8 +4082,44 @@ void test_loadobjopt_from_buffer() {
   TEST_CHECK(attrib.vertices[3] == 1.0f);
 }
 
-void test_loadobjopt_from_file() {
-  tinyobj::basic_attrib_t<> attrib;
+// The optimized loaders share MaterialFileReader, so material origins must
+// surface the same way there as with the classic loader.
+void test_material_origin_optimized_loaders() {
+  tinyobj::OptLoadConfig config;
+  config.num_threads = 1;
+  config.triangulate = true;
+
+  // (a) LoadObjOpt (file).
+  {
+    tinyobj::basic_attrib_t<> attrib;
+    std::vector<tinyobj::basic_shape_t<>> shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+    bool ret = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
+                                   "../models/cornell_box.obj", gMtlBasePath,
+                                   config);
+    TEST_CHECK(ret == true);
+    TEST_CHECK(!materials.empty());
+    if (!materials.empty()) {
+      // Library opened through gMtlBasePath; origin follows the library.
+      TEST_CHECK(materials[0].texpath == gMtlBasePath);
+    }
+  }
+
+  // (b) LoadObjOptTyped (file).
+  {
+    std::string warn, err;
+    tinyobj::OptResult result = tinyobj::LoadObjOptTyped(
+        "../models/cornell_box.obj", &warn, &err, gMtlBasePath, config);
+    TEST_CHECK(result.valid == true);
+    TEST_CHECK(!result.materials.empty());
+    if (!result.materials.empty()) {
+      TEST_CHECK(result.materials[0].texpath == gMtlBasePath);
+    }
+  }
+}
+
+void test_loadobjopt_from_file() {  tinyobj::basic_attrib_t<> attrib;
   std::vector<tinyobj::basic_shape_t<>> shapes;
   std::vector<tinyobj::material_t> materials;
   std::string warn, err;
@@ -4254,6 +4953,23 @@ TEST_LIST = {
      test_usemtl_then_o_issue235},
     {"mtl_searchpaths_issue244",
      test_mtl_searchpaths_issue244},
+    {"material_origin_isolated_between_models",
+     test_material_origin_isolated_between_models},
+    {"material_search_priority_preserved_with_texpath",
+     test_material_search_priority_preserved_with_texpath},
+    {"material_failed_library_keeps_valid_references",
+     test_material_failed_library_keeps_valid_references},
+    {"material_origin_with_whitespace_paths",
+     test_material_origin_with_whitespace_paths},
+    {"material_same_name_across_libraries_in_one_load",
+     test_material_same_name_across_libraries_in_one_load},
+    {"material_origin_duplicate_references_stable",
+     test_material_origin_duplicate_references_stable},
+    {"material_origin_not_leaked_across_reloads",
+     test_material_origin_not_leaked_across_reloads},
+    {"material_origin_optimized_loaders",
+     test_material_origin_optimized_loaders},
+    {"resolve_texpath_edge_cases", test_resolve_texpath_edge_cases},
     {"usemtl_whitespace_issue246",
      test_usemtl_whitespace_issue246},
     {"texres_texopt_issue248",

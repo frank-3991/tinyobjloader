@@ -141,6 +141,9 @@ PYBIND11_MODULE(tinyobjloader, tobj_module)
     .def_readwrite("sheen_texname", &material_t::sheen_texname)
     .def_readwrite("emissive_texname", &material_t::emissive_texname)
     .def_readwrite("normal_texname", &material_t::normal_texname)
+    // Directory of the .mtl file that defined this material (empty for
+    // stream input). Combine with the *_texname fields to locate textures.
+    .def_readwrite("texpath", &material_t::texpath)
 
     .def("GetCustomParameter", &material_t::GetCustomParameter)
     ;

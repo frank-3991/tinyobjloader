@@ -81,6 +81,41 @@ The pure C11 loader additionally supports points (`p`) and free-form geometry
 * PBR material extension for .MTL. Please see [pbr-mtl.md](pbr-mtl.md) for details.
 * Texture options
 * Unknown material attributes are returned as key-value(value is string) map.
+* Per-model texture origin: `material_t::texpath` records the directory of the
+  `.mtl` file that defined the material, and `ResolveTexPath()` joins a texture
+  name to it. See below.
+
+#### Material library origin and texture paths
+
+Texture names in a `.mtl` are relative to that `.mtl` file, not to the `.obj`
+that referenced it. Several models may each load their own copy of a
+same-named library (e.g. `scene.mtl`) with different textures, so the loader
+records where each material actually came from instead of assuming one global
+directory:
+
+```c++
+// material_t::diffuse_texname keeps the name exactly as written ("wall.png"),
+// so existing callers are unaffected. texpath holds the directory of the .mtl
+// that defined this material (with its trailing separator).
+std::string path =
+    tinyobj::ResolveTexPath(materials[i].diffuse_texname, materials[i]);
+// e.g. "models/chapter1/scene.mtl" -> "models/chapter1/" + "wall.png"
+```
+
+* The search priority for locating a library is unchanged: with several
+  `mtl_basedir` entries, the first one that yields an openable file wins, and
+  the recorded origin is that winning file's directory.
+* Within one load, a material name resolves to the first definition (existing
+  behaviour); repeating an `mtllib` line does not re-read it.
+* A library that cannot be opened or parsed only warns and is skipped; valid
+  libraries referenced alongside it still load, and faces using a material
+  that was never defined keep the default material id (`-1`).
+* With stream input (`MaterialStreamReader`) or no search path, `texpath`
+  stays empty and `ResolveTexPath()` returns the texture name unchanged, so
+  historical behaviour is preserved.
+* `LoadObj` and `ObjReader` reset the material list at the start of each load,
+  so reusing an output vector or reader across models cannot mix their
+  materials or texture origins.
 
 ## TODO
 

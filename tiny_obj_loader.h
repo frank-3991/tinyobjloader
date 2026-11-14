@@ -32,6 +32,10 @@ THE SOFTWARE.
 //                 extension). Note that this differs vertex weight([w]
 //                 component in `v` line)
 //                 * Support escaped whitespece in mtllib
+//                 * Record the defining .mtl's directory in
+//                 `material_t::texpath` and add `ResolveTexPath()` so relative
+//                 texture references follow the library that declared them
+//                 (keeps several models' same-named .mtl copies isolated).
 //                 * Add robust triangulation using Mapbox
 //                 earcut(TINYOBJLOADER_USE_MAPBOX_EARCUT).
 // version 1.4.0 : Modifed ParseTextureNameAndOption API
@@ -236,6 +240,18 @@ struct material_t {
   std::string sheen_texname;      // map_Ps
   std::string emissive_texname;   // map_Ke
   std::string normal_texname;     // norm. For normal mapping.
+
+  // Directory of the .mtl file that actually defined this material, including
+  // a trailing path separator. Empty when the material came from a stream, or
+  // when the library was opened with no directory component and no search path.
+  //
+  // Texture names above are kept exactly as written in the .mtl file, so this
+  // records the base directory that relative texture references are meant to
+  // be resolved against. When several `.obj` files each load their own copy of
+  // a same-named .mtl from different folders, this keeps each model's texture
+  // origin distinct instead of collapsing them onto one search path.
+  // Use `ResolveTexPath()` to obtain the resolved texture path.
+  std::string texpath;
 
   texture_option_t roughness_texopt;
   texture_option_t metallic_texopt;
@@ -741,6 +757,30 @@ void LoadMtl(std::map<std::string, int> *material_map,
 ///
 bool ParseTextureNameAndOption(std::string *texname, texture_option_t *texopt,
                                const char *linebuf);
+
+///
+/// Resolve a texture filename parsed from a .mtl file into a path that can be
+/// opened from the process working directory.
+///
+/// `texname` is the texture filename exactly as written in the .mtl file, and
+/// `texpath` is `material_t::texpath` of the material it came from (the
+/// directory of the .mtl file that defined the material).
+///
+/// - An absolute `texname` is returned unchanged.
+/// - When `texpath` is empty, `texname` is returned unchanged, so stream input
+///   and the plain historical behaviour stay the same.
+/// - Otherwise the two are joined with a path separator.
+///
+/// The result is *not* checked for existence; callers decide how a missing
+/// texture is handled.
+///
+std::string ResolveTexPath(const std::string &texname,
+                           const std::string &texpath);
+
+/// `material_t` convenience overload of `ResolveTexPath()`, equivalent to
+/// `ResolveTexPath(texname, material.texpath)`.
+std::string ResolveTexPath(const std::string &texname,
+                           const material_t &material);
 
 /// =<<========== Legacy v1 API =============================================
 
@@ -7595,6 +7635,11 @@ static void InitMaterial(material_t *material) {
   material->emissive_texname = "";
   material->normal_texname = "";
 
+  // Directory of the .mtl file that defines the material. Filled by the
+  // material reader; empty for stream input and for materials defined outside
+  // any search path.
+  material->texpath = "";
+
   material->unknown_parameter.clear();
 }
 
@@ -8275,11 +8320,51 @@ static std::string JoinPath(const std::string &dir,
   }
 }
 
+// True when `path` starts with a root that makes it independent of the
+// current working directory: a POSIX absolute path ("/x"), a Windows drive
+// path ("C:x"), or a Windows UNC path ("//server/share").
+static bool IsAbsolutePath(const std::string &path) {
+  if (path.empty()) return false;
+  if (path[0] == '/' || path[0] == '\\') return true;
+  return path.size() >= 2 && path[1] == ':';
+}
+
+std::string ResolveTexPath(const std::string &texname,
+                           const std::string &texpath) {
+  if (texname.empty()) return texname;
+  if (IsAbsolutePath(texname)) return texname;
+  if (texpath.empty()) return texname;
+
+  // A bare filename always means "next to the .mtl that named it". A
+  // directory-qualified name is treated the same way: the Wavefront format
+  // resolves texture references relative to the .mtl, not to the .obj.
+  char last = texpath[texpath.size() - 1];
+  if (last == '/' || last == '\\') {
+    return texpath + texname;
+  }
+  return texpath + "/" + texname;
+}
+
+std::string ResolveTexPath(const std::string &texname,
+                           const material_t &material) {
+  return ResolveTexPath(texname, material.texpath);
+}
+
+// Directory part of `path`, including its trailing separator ("" when `path`
+// has no directory part). This is the directory a `.mtl` file was read from,
+// and therefore what its relative texture references resolve against.
+static std::string DirNameWithSeparator(const std::string &path) {
+  size_t pos = path.find_last_of("/\\");
+  if (pos == std::string::npos) return std::string();
+  return path.substr(0, pos + 1);
+}
+
 static bool LoadMtlInternal(std::map<std::string, int> *material_map,
                             std::vector<material_t> *materials,
                             StreamReader &sr,
                             std::string *warning, std::string *err,
-                            const std::string &filename = "<stream>") {
+                            const std::string &filename = "<stream>",
+                            const std::string &texpath = std::string()) {
   if (sr.has_errors()) {
     if (err) {
       (*err) += sr.get_errors();
@@ -8289,6 +8374,9 @@ static bool LoadMtlInternal(std::map<std::string, int> *material_map,
 
   material_t material;
   InitMaterial(&material);
+  // Record where this .mtl was found so relative texture references in it stay
+  // attached to the library that actually defined the material.
+  material.texpath = texpath;
 
   // Issue 43. `d` wins against `Tr` since `Tr` is not in the MTL specification.
   bool has_d = false;
@@ -8325,6 +8413,8 @@ static bool LoadMtlInternal(std::map<std::string, int> *material_map,
       }
 
       InitMaterial(&material);
+      // Every material in this file shares the .mtl file's own directory.
+      material.texpath = texpath;
 
       has_d = false;
       has_tr = false;
@@ -8741,6 +8831,17 @@ bool MaterialFileReader::operator()(const std::string &matId,
     for (size_t i = 0; i < paths.size(); i++) {
       std::string filepath = JoinPath(paths[i], matId);
 
+      // The .mtl file that actually opened is `filepath`. Its own directory is
+      // what relative texture names inside it resolve against, so that is what
+      // gets recorded. `matId` may itself carry a directory part (e.g.
+      // "mtllib sub/foo.mtl"), in which case the directory of `filepath` is
+      // `paths[i] + "sub/"`, not just `paths[i]`.
+      //
+      // This keeps the search loop's existing priority order untouched: the
+      // first search entry that yields an openable file still wins, and only
+      // that file's directory is attributed to the materials it defines.
+      const std::string m_dir = DirNameWithSeparator(filepath);
+
 #ifdef TINYOBJLOADER_USE_MMAP
       {
         MappedFile mf;
@@ -8756,7 +8857,8 @@ bool MaterialFileReader::operator()(const std::string &matId,
           return false;
         }
         StreamReader sr(mf.data, mf.size);
-        return LoadMtlInternal(matMap, materials, sr, warn, err, filepath);
+        return LoadMtlInternal(matMap, materials, sr, warn, err, filepath,
+                               m_dir);
       }
 #else   // !TINYOBJLOADER_USE_MMAP
 #ifdef _WIN32
@@ -8766,7 +8868,8 @@ bool MaterialFileReader::operator()(const std::string &matId,
 #endif
       if (matIStream) {
         StreamReader mtl_sr(matIStream);
-        return LoadMtlInternal(matMap, materials, mtl_sr, warn, err, filepath);
+        return LoadMtlInternal(matMap, materials, mtl_sr, warn, err, filepath,
+                               m_dir);
       }
 #endif  // TINYOBJLOADER_USE_MMAP
     }
@@ -8781,6 +8884,10 @@ bool MaterialFileReader::operator()(const std::string &matId,
 
   } else {
     std::string filepath = matId;
+
+    // No search path: `matId` is opened relative to the working directory, so
+    // its own directory part is what texture references resolve against.
+    const std::string m_dir = DirNameWithSeparator(filepath);
 
 #ifdef TINYOBJLOADER_USE_MMAP
     {
@@ -8797,7 +8904,8 @@ bool MaterialFileReader::operator()(const std::string &matId,
           return false;
         }
         StreamReader sr(mf.data, mf.size);
-        return LoadMtlInternal(matMap, materials, sr, warn, err, filepath);
+        return LoadMtlInternal(matMap, materials, sr, warn, err, filepath,
+                               m_dir);
       }
     }
 #else   // !TINYOBJLOADER_USE_MMAP
@@ -8808,7 +8916,8 @@ bool MaterialFileReader::operator()(const std::string &matId,
 #endif
     if (matIStream) {
       StreamReader mtl_sr(matIStream);
-      return LoadMtlInternal(matMap, materials, mtl_sr, warn, err, filepath);
+      return LoadMtlInternal(matMap, materials, mtl_sr, warn, err, filepath,
+                             m_dir);
     }
 #endif  // TINYOBJLOADER_USE_MMAP
 
@@ -9417,6 +9526,10 @@ bool LoadObj(attrib_t *attrib, std::vector<shape_t> *shapes,
   attrib->colors.clear();
   attrib->skin_weights.clear();
   shapes->clear();
+  // Outputs are reset together. `material_ids` on the returned shapes index
+  // into this list, so leaving a previous model's materials behind would mix
+  // two models' material indices and texture origins in one load.
+  if (materials) materials->clear();
 
   std::string baseDir = mtl_basedir ? mtl_basedir : "";
   if (!baseDir.empty()) {
@@ -9491,6 +9604,9 @@ bool LoadObj(attrib_t *attrib, std::vector<shape_t> *shapes,
   attrib->colors.clear();
   attrib->skin_weights.clear();
   shapes->clear();
+  // See the file-based overload: material indices in `shapes` refer to this
+  // freshly reset list.
+  if (materials) materials->clear();
 
   StreamReader sr(*inStream);
   return LoadObjInternal(attrib, shapes, materials, warn, err, sr,
