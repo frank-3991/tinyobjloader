@@ -6,6 +6,7 @@
 #include "acutest.h"
 #include "tiny_obj_c.h"
 
+#include <stdio.h>
 #include <string.h>
 
 /* ---- helpers ----------------------------------------------------------- */
@@ -40,6 +41,15 @@ static const char *load_string_f(const char *obj, tobj_scene_f *sc,
       tobj_load_obj_from_memory_f(sc, (const uint8_t *)obj, strlen(obj), &cfg,
                                   NULL);
   return tobj_result_string(r);
+}
+
+/* Load with index validation explicitly on or off, aggregating diagnostics. */
+static tobj_result load_strict_f(const char *obj, bool strict, tobj_scene_f *sc,
+                                 tobj_diag *diag) {
+  tobj_load_config cfg = tobj_default_config();
+  cfg.strict_index_validation = strict;
+  return tobj_load_obj_from_memory_f(sc, (const uint8_t *)obj, strlen(obj),
+                                     &cfg, diag);
 }
 
 typedef struct mem_io {
@@ -128,7 +138,358 @@ static void test_both_precisions(void) {
   tobj_scene_free_d(&sd);
 }
 
-/* ---- targeted regressions --------------------------------------------- */
+/* ---- strict index validation ------------------------------------------- */
+
+/* Strict mode must accept a well-formed model and produce exactly the same
+ * geometry/topology as the lenient default. */
+static void test_strict_accepts_valid(void) {
+  const char *obj =
+      "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvn 0 0 1\n"
+      "f 1/1/1 2/1/1 3/1/1\n";
+  tobj_scene_f lax, strict;
+  tobj_diag diag;  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(obj, false, &lax, NULL) == TOBJ_OK);
+  TEST_CHECK(load_strict_f(obj, true, &strict, &diag) == TOBJ_OK);
+  TEST_CHECK(diag.err == NULL && diag.warn == NULL);
+  TEST_CHECK(lax.num_shapes == 1 && strict.num_shapes == 1);
+  TEST_CHECK(lax.shapes[0].mesh.num_indices == strict.shapes[0].mesh.num_indices);
+  TEST_CHECK(lax.attrib.vertices.count == strict.attrib.vertices.count);
+  for (size_t i = 0; i < strict.shapes[0].mesh.num_indices; i++) {
+    TEST_CHECK(lax.shapes[0].mesh.indices[i].vertex_index ==
+               strict.shapes[0].mesh.indices[i].vertex_index);
+    TEST_CHECK(lax.shapes[0].mesh.indices[i].texcoord_index ==
+               strict.shapes[0].mesh.indices[i].texcoord_index);
+    TEST_CHECK(lax.shapes[0].mesh.indices[i].normal_index ==
+               strict.shapes[0].mesh.indices[i].normal_index);
+  }
+  tobj_diag_free(&diag, NULL);
+  tobj_scene_free_f(&lax);
+  tobj_scene_free_f(&strict);
+}
+
+/* Missing optional attributes are "absent", never negative indices: a face
+ * without vt/vn is legal under strict validation and keeps -1 sentinels. */
+static void test_strict_absent_optional_is_not_error(void) {
+  const char *obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+  tobj_scene_f sc;
+  tobj_diag diag;
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(obj, true, &sc, &diag) == TOBJ_OK);
+  TEST_CHECK(diag.err == NULL);
+  TEST_CHECK(sc.shapes[0].mesh.indices[0].texcoord_index == -1);
+  TEST_CHECK(sc.shapes[0].mesh.indices[0].normal_index == -1);
+  tobj_diag_free(&diag, NULL);
+  tobj_scene_free_f(&sc);
+}
+
+/* Positive out-of-range vertex reference: strict fails and points at the line;
+ * the scene must not look like a usable mesh afterwards. */
+static void test_strict_rejects_vertex_out_of_range(void) {
+  const char *obj = "v 0 0 0\nv 1 0 0\nf 1 2 4\n";
+  tobj_scene_f sc;
+  tobj_diag diag;
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(obj, true, &sc, &diag) == TOBJ_ERR_PARSE);
+  TEST_CHECK(sc.num_shapes == 0);
+  TEST_CHECK(sc.attrib.vertices.count == 0);
+  TEST_CHECK(diag.err && strstr(diag.err, "line 3"));
+  TEST_CHECK(diag.err && strstr(diag.err, "corner 3 of 3"));
+  TEST_CHECK(diag.err && strstr(diag.err, "vertex"));
+
+  /* The same model under the default lenient mode still loads. */
+  tobj_scene_f lax;
+  TEST_CHECK(load_strict_f(obj, false, &lax, NULL) == TOBJ_OK);
+  TEST_CHECK(lax.num_shapes == 1);
+  tobj_scene_free_f(&lax);
+  tobj_diag_free(&diag, NULL);
+}
+
+/* Negative (relative) reference that reaches before the start of the data. */
+static void test_strict_rejects_relative_before_start(void) {
+  const char *obj = "v 0 0 0\nf -2 -1 1\n";
+  tobj_scene_f sc;
+  tobj_diag diag;
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(obj, true, &sc, &diag) == TOBJ_ERR_PARSE);
+  TEST_CHECK(diag.err && strstr(diag.err, "line 2"));
+  TEST_CHECK(diag.err && strstr(diag.err, "vertex index -2"));
+  tobj_diag_free(&diag, NULL);
+}
+
+/* A valid negative reference must stay valid in strict mode. */
+static void test_strict_accepts_relative_index(void) {
+  const char *obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -3 -2 -1\n";
+  tobj_scene_f sc;
+  TEST_CHECK(load_strict_f(obj, true, &sc, NULL) == TOBJ_OK);
+  TEST_CHECK(sc.shapes[0].mesh.indices[0].vertex_index == 0);
+  TEST_CHECK(sc.shapes[0].mesh.indices[2].vertex_index == 2);
+  tobj_scene_free_f(&sc);
+}
+
+/* Texcoord and normal references are validated too, for positive and
+ * relative forms, and the diagnostic names the offending field. */
+static void test_strict_rejects_texcoord_and_normal(void) {
+  tobj_scene_f sc;
+  tobj_diag diag;
+
+  const char *vt_obj =
+      "v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nf 1/1 2/2 3/1\n";
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(vt_obj, true, &sc, &diag) == TOBJ_ERR_PARSE);
+  TEST_CHECK(diag.err && strstr(diag.err, "texcoord"));
+  TEST_CHECK(diag.err && strstr(diag.err, "line 5"));
+  tobj_diag_free(&diag, NULL);
+
+  const char *vn_obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nvn 0 0 1\nf 1//1 2//2 3//1\n";
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(vn_obj, true, &sc, &diag) == TOBJ_ERR_PARSE);
+  TEST_CHECK(diag.err && strstr(diag.err, "normal"));
+  tobj_diag_free(&diag, NULL);
+
+  /* relative texcoord that resolves is fine; one that runs off the front is not */
+  const char *vt_rel_ok = "vt 0 0\nvt 1 0\nvt 0 1\n"
+                          "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+                          "f 1/-3 2/-2 3/-1\n";
+  TEST_CHECK(load_strict_f(vt_rel_ok, true, &sc, NULL) == TOBJ_OK);
+  TEST_CHECK(sc.shapes[0].mesh.indices[0].texcoord_index == 0);
+  TEST_CHECK(sc.shapes[0].mesh.indices[1].texcoord_index == 1);
+  TEST_CHECK(sc.shapes[0].mesh.indices[2].texcoord_index == 2);
+  tobj_scene_free_f(&sc);
+
+  const char *vt_rel_bad = "vt 0 0\nv 0 0 0\nv 1 0 0\nv 0 1 0\n"
+                           "f 1/-2 2/-1 3/-1\n";
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(vt_rel_bad, true, &sc, &diag) == TOBJ_ERR_PARSE);
+  tobj_diag_free(&diag, NULL);
+}
+
+/* Index 0 is invalid per the format; strict rejects it while the lenient
+ * default keeps its historical -1 / warning behaviour. */
+static void test_strict_rejects_zero_index(void) {
+  const char *obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n";
+  tobj_scene_f sc;
+  tobj_diag diag;
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(obj, true, &sc, &diag) == TOBJ_ERR_PARSE);
+  TEST_CHECK(diag.err && strstr(diag.err, "zero"));
+  tobj_diag_free(&diag, NULL);
+
+  tobj_diag laxdiag;
+  memset(&laxdiag, 0, sizeof laxdiag);
+  TEST_CHECK(load_strict_f(obj, false, &sc, &laxdiag) == TOBJ_OK);
+  TEST_CHECK(sc.shapes[0].mesh.indices[0].vertex_index == -1);
+  TEST_CHECK(laxdiag.warn && strstr(laxdiag.warn, "invalid vertex index"));
+  tobj_scene_free_f(&sc);
+  tobj_diag_free(&laxdiag, NULL);
+}
+
+/* Faces may mix positive and negative references; a valid mix must resolve
+ * to the same vertex/texcoord/normal for both spellings of every corner. */
+static void test_strict_mixed_positive_and_relative(void) {
+  const char *obj =
+      "v 0 0 0\nv 1 0 0\nv 0 1 0\n"
+      "vt 0 0\nvt 1 0\nvt 0 1\n"
+      "vn 0 0 1\nvn 0 0 1\nvn 0 0 1\n"
+      "f 1/1/1 2/2/2 3/3/3\n"
+      "f -3/-3/-3 -2/-2/-2 -1/-1/-1\n";
+  tobj_scene_f sc;
+  TEST_CHECK(load_strict_f(obj, true, &sc, NULL) == TOBJ_OK);
+  TEST_CHECK(sc.shapes[0].mesh.num_indices == 6);
+  for (int f = 0; f < 2; f++) {
+    for (int k = 0; k < 3; k++) {
+      const tobj_index *ix = &sc.shapes[0].mesh.indices[f * 3 + k];
+      TEST_CHECK(ix->vertex_index == k);
+      TEST_CHECK(ix->texcoord_index == k);
+      TEST_CHECK(ix->normal_index == k);
+    }
+  }
+  tobj_scene_free_f(&sc);
+}
+
+/* Lines and points validate their references the same way. */
+static void test_strict_lines_and_points(void) {
+  const char *good = "v 0 0 0\nv 1 0 0\nv 2 0 0\nl 1 2 -3\np -1\n";
+  tobj_scene_f sc;
+  TEST_CHECK(load_strict_f(good, true, &sc, NULL) == TOBJ_OK);
+  TEST_CHECK(sc.shapes[0].lines.num_indices == 3);
+  TEST_CHECK(sc.shapes[0].points.num_indices == 1);
+  TEST_CHECK(sc.shapes[0].points.indices[0].vertex_index == 2);
+  tobj_scene_free_f(&sc);
+
+  const char *bad_line = "v 0 0 0\nv 1 0 0\nl 1 5\n";
+  tobj_diag diag;
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(bad_line, true, &sc, &diag) == TOBJ_ERR_PARSE);
+  TEST_CHECK(diag.err && strstr(diag.err, "line at line 3"));
+  tobj_diag_free(&diag, NULL);
+
+  const char *bad_point = "v 0 0 0\np 3\n";
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(load_strict_f(bad_point, true, &sc, &diag) == TOBJ_ERR_PARSE);
+  TEST_CHECK(diag.err && strstr(diag.err, "point"));
+  tobj_diag_free(&diag, NULL);
+}
+
+/* The same guarantees hold on the streaming-callback entry point. */
+typedef struct cb_counts {
+  int vertex, face, line, point;
+} cb_counts;
+
+static void cb_vertex(void *ud, float x, float y, float z, float w) {
+  (void)x;
+  (void)y;
+  (void)z;
+  (void)w;
+  ((cb_counts *)ud)->vertex++;
+}
+static void cb_index(void *ud, const tobj_index *i, int n) {
+  (void)i;
+  (void)n;
+  ((cb_counts *)ud)->face++;
+}
+static void cb_line(void *ud, const tobj_index *i, int n) {
+  (void)i;
+  (void)n;
+  ((cb_counts *)ud)->line++;
+}
+static void cb_point(void *ud, const tobj_index *i, int n) {
+  (void)i;
+  (void)n;
+  ((cb_counts *)ud)->point++;
+}
+
+static void test_strict_streaming_callbacks(void) {
+  const char *obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+  tobj_callbacks_f cb;
+  memset(&cb, 0, sizeof cb);
+  cb_counts counts;
+  memset(&counts, 0, sizeof counts);
+  cb.vertex_cb = cb_vertex;
+  cb.index_cb = cb_index;
+  cb.line_cb = cb_line;
+  cb.point_cb = cb_point;
+  cb.user_data = &counts;
+
+  tobj_load_config cfg = tobj_default_config();
+  cfg.strict_index_validation = true;
+  tobj_diag diag;
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(tobj_load_obj_with_callbacks_f(
+                 (const uint8_t *)obj, strlen(obj), &cb, &cfg, &diag) ==
+             TOBJ_OK);
+  TEST_CHECK(counts.face == 1);
+  tobj_diag_free(&diag, NULL);
+
+  const char *bad = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 4\n";
+  memset(&counts, 0, sizeof counts);
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(tobj_load_obj_with_callbacks_f(
+                 (const uint8_t *)bad, strlen(bad), &cb, &cfg, &diag) ==
+             TOBJ_ERR_PARSE);
+  TEST_CHECK(counts.face == 0); /* the bad face is not delivered */
+  TEST_CHECK(diag.err && strstr(diag.err, "line 4"));
+  tobj_diag_free(&diag, NULL);
+}
+
+/* The lenient streaming loader resolves bad references against its own running
+ * counters (not the scene builder's, which stays empty on this path), matching
+ * what it did before the strict option existed. A zero vertex index becomes
+ * -1 and is still delivered; a relative reference resolves against the
+ * streamed vertex count. */
+typedef struct cb_first {
+  tobj_index first;
+  int n;
+} cb_first;
+
+static void cb_first_index(void *ud, const tobj_index *i, int n) {
+  cb_first *f = (cb_first *)ud;
+  if (f->n == 0 && n > 0) f->first = i[0];
+  f->n++;
+}
+
+static void test_lenient_streaming_keeps_legacy_indices(void) {
+  const char *zero_obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 0 1 2\n";
+  const char *rel_obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf -3 -2 -1\n";
+  tobj_callbacks_f cb;
+  memset(&cb, 0, sizeof cb);
+  cb.index_cb = cb_first_index;
+
+  tobj_load_config cfg = tobj_default_config(); /* strict off */
+
+  cb_first seen;
+  memset(&seen, 0, sizeof seen);
+  cb.user_data = &seen;
+  TEST_CHECK(tobj_load_obj_with_callbacks_f(
+                 (const uint8_t *)zero_obj, strlen(zero_obj), &cb, &cfg,
+                 NULL) == TOBJ_OK);
+  TEST_CHECK(seen.n == 1);
+  TEST_CHECK(seen.first.vertex_index == -1);
+  TEST_CHECK(seen.first.texcoord_index == -1);
+  TEST_CHECK(seen.first.normal_index == -1);
+
+  memset(&seen, 0, sizeof seen);
+  TEST_CHECK(tobj_load_obj_with_callbacks_f(
+                 (const uint8_t *)rel_obj, strlen(rel_obj), &cb, &cfg, NULL) ==
+             TOBJ_OK);
+  TEST_CHECK(seen.n == 1);
+  TEST_CHECK(seen.first.vertex_index == 0);
+}
+
+/* Free-form control points are index references too. */
+static void test_strict_freeform_surface(void) {
+  const char *obj = "v 0 0 0\nv 1 0 0\ncstype bezier\ndeg 1 1\n"
+                    "surf 0 1 0 1 1 2 3\n";
+  tobj_load_config cfg = tobj_default_config();
+  cfg.strict_index_validation = true;
+  cfg.parse_freeform = true;
+  tobj_scene_f sc;
+  tobj_diag diag;
+  memset(&diag, 0, sizeof diag);
+  TEST_CHECK(tobj_load_obj_from_memory_f(
+                 &sc, (const uint8_t *)obj, strlen(obj), &cfg, &diag) ==
+             TOBJ_ERR_PARSE);
+  TEST_CHECK(diag.err && strstr(diag.err, "surf"));
+  tobj_diag_free(&diag, NULL);
+}
+
+/* A large model with cross-face mixed indexing must produce identical results
+ * with strict validation on, on the multithreaded and single-threaded paths
+ * alike (the MT build resolves relative indices against running counts). */
+static void test_strict_large_mixed_model(void) {
+  enum { NV = 4000, NF = 1200 };
+  static char obj[NV * 16 + NF * 64];
+  size_t n = 0;
+  for (int i = 0; i < NV; i++) n += (size_t)sprintf(obj + n, "v %d 0 0\n", i);
+  for (int f = 0; f < NF; f++) {
+    int base = f % (NV - 3);
+    if ((f & 1) == 0)
+      n += (size_t)sprintf(obj + n, "f %d %d %d\n", base + 1, base + 2,
+                           base + 3);
+    else
+      n += (size_t)sprintf(obj + n, "f -%d -%d -%d\n", NV - base, NV - base - 1,
+                           NV - base - 2);
+  }
+  tobj_load_config cfg = tobj_default_config();
+  cfg.strict_index_validation = true;
+  tobj_scene_f sc;
+  TEST_CHECK(tobj_load_obj_from_memory_f(&sc, (const uint8_t *)obj, n, &cfg,
+                                         NULL) == TOBJ_OK);
+  size_t numv = sc.attrib.vertices.count / 3;
+  TEST_CHECK(numv == NV);
+  size_t total = 0;
+  for (size_t s = 0; s < sc.num_shapes; s++) total += sc.shapes[s].mesh.num_indices;
+  TEST_CHECK(total == (size_t)NF * 3);
+  for (size_t s = 0; s < sc.num_shapes; s++) {
+    for (size_t i = 0; i < sc.shapes[s].mesh.num_indices; i++) {
+      int vi = sc.shapes[s].mesh.indices[i].vertex_index;
+      TEST_CHECK(vi >= 0 && (size_t)vi < numv);
+    }
+  }
+  tobj_scene_free_f(&sc);
+}
+
+/* ---- strict index validation end --------------------------------------- */
+
 
 static void test_quad_triangulation(void) {
   tobj_scene_f sc;
@@ -384,6 +745,25 @@ static void test_allocator_without_calloc_or_realloc(void) {
 TEST_LIST = {
     {"corpus_loads", test_corpus_loads},
     {"both_precisions", test_both_precisions},
+    {"strict_accepts_valid", test_strict_accepts_valid},
+    {"strict_absent_optional_is_not_error",
+     test_strict_absent_optional_is_not_error},
+    {"strict_rejects_vertex_out_of_range",
+     test_strict_rejects_vertex_out_of_range},
+    {"strict_rejects_relative_before_start",
+     test_strict_rejects_relative_before_start},
+    {"strict_accepts_relative_index", test_strict_accepts_relative_index},
+    {"strict_rejects_texcoord_and_normal",
+     test_strict_rejects_texcoord_and_normal},
+    {"strict_rejects_zero_index", test_strict_rejects_zero_index},
+    {"strict_mixed_positive_and_relative",
+     test_strict_mixed_positive_and_relative},
+    {"strict_lines_and_points", test_strict_lines_and_points},
+    {"strict_streaming_callbacks", test_strict_streaming_callbacks},
+    {"lenient_streaming_keeps_legacy_indices",
+     test_lenient_streaming_keeps_legacy_indices},
+    {"strict_freeform_surface", test_strict_freeform_surface},
+    {"strict_large_mixed_model", test_strict_large_mixed_model},
     {"quad_triangulation", test_quad_triangulation},
     {"no_triangulation", test_no_triangulation},
     {"negative_relative_index", test_negative_relative_index},

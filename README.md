@@ -429,6 +429,17 @@ Properties:
 * **Materials.** Phong + PBR + texture options, unknown-parameter map,
   standalone `.mtl` parsing, a material-resolver callback, and a streaming
   callback API.
+* **Optional strict index validation.** `tobj_load_config::
+  strict_index_validation` makes every face / line / point / free-form
+  reference prove that the element it names already exists at that point in the
+  file, for vertices, texcoords and normals alike, and for positive (1-based)
+  and negative (relative) spellings of the same index. A rejected reference
+  fails the load with `TOBJ_ERR_PARSE`, reports the offending line, statement
+  and corner as a `TOBJ_SEV_ERROR` diagnostic, and leaves the output scene
+  zeroed, so a failed parse can never be mistaken for a complete mesh. Faces
+  may freely mix positive and relative references. Missing optional attributes
+  (say, a corner with no `vt`) are absent, not negative indices, and stay
+  valid. Off by default, where the historical lenient behaviour is unchanged.
 * **Optional speed-ups** behind macros (scalar / single-threaded by default):
   `TOBJ_ENABLE_MULTITHREADING`, `TOBJ_ENABLE_SIMD`, `TOBJ_ENABLE_MMAP`.
 
@@ -462,8 +473,28 @@ tobj_diag_free(&diag, NULL);
 
 Use the `_d` variants for double precision, `tobj_load_obj_from_memory_f` for
 the freestanding / in-memory path, `tobj_load_obj_from_io_f` for custom byte
-input, and `tobj_load_obj_with_callbacks_f` for parse-event callbacks. Build
-with CMake (`-DTINYOBJLOADER_BUILD_C_LIBRARY=ON`, the default; options
+input, and `tobj_load_obj_with_callbacks_f` for parse-event callbacks. For a
+mesh you can trust before touching attribute arrays, opt into strict index
+validation:
+
+```c
+tobj_load_config cfg = tobj_default_config();
+cfg.strict_index_validation = true;   /* reject bad vertex/vt/vn references */
+tobj_diag diag = {0};
+
+tobj_scene_f scene;
+tobj_result r = tobj_load_obj_from_file_f(&scene, "scene.obj", &cfg, &diag);
+if (r != TOBJ_OK) {
+  /* r == TOBJ_ERR_PARSE on a bad index; diag.err names the line and corner.
+   * `scene` is zeroed, so there is no partial mesh to accidentally consume. */
+  fprintf(stderr, "%s", diag.err ? diag.err : tobj_result_string(r));
+  tobj_diag_free(&diag, NULL);
+  return 1;
+}
+tobj_diag_free(&diag, NULL);
+```
+
+Build with CMake (`-DTINYOBJLOADER_BUILD_C_LIBRARY=ON`, the default; options
 `TINYOBJLOADER_C_ENABLE_FILE_IO` / `MMAP` / `SIMD` / `MULTITHREADING`) or simply
 compile `tiny_obj_c.c` and `tobj_tess.c`. C tests live under `tests/`
 (`make check_c`).

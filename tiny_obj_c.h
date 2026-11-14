@@ -192,6 +192,19 @@ typedef struct tobj_load_config {
 
   tobj_material_resolver mtl_resolver;
   void *mtl_resolver_user_data;
+
+  /* Reject face/line/point/free-form references that do not resolve to an
+   * element that already exists at that point in the file, for all three
+   * reference kinds (vertex, texcoord, normal). Positive (1-based) and negative
+   * (relative) indices are judged the same way, and index 0 is rejected. On the
+   * first bad reference the load fails with TOBJ_ERR_PARSE (never TOBJ_OK), a
+   * TOBJ_SEV_ERROR diagnostic names the line, statement and corner, and the
+   * output scene is zeroed so it can never be mistaken for a complete mesh.
+   * Missing optional attributes (e.g. no `vt` in a face corner) are "absent",
+   * not negative indices, and never trigger this. When false (the default) the
+   * lenient historical behaviour is preserved unchanged. Kept last so
+   * positional initializers of the older fields keep working. */
+  bool strict_index_validation; /* default false */
 } tobj_load_config;
 
 TOBJ_API tobj_load_config tobj_default_config(void);

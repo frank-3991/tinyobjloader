@@ -21,6 +21,7 @@ typedef struct TOBJ_T(tobj_builder) {
   size_t line; /* 1-based current line for diagnostics */
 
   bool triangulate;
+  bool strict; /* cfg->strict_index_validation (cached) */
 
   /* attrib temp vectors (reals / structs) */
   tobj_vec av;   /* vertices xyz */
@@ -112,62 +113,189 @@ static void TOBJ_T(b_warn)(TOBJ_T(tobj_builder) * b, const char *msg) {
 /* index fixup (1-based -> 0-based, negative -> relative)                  */
 /* ----------------------------------------------------------------------- */
 
-static bool TOBJ_T(fix_index)(int idx, size_t n, int *out) {
+/* Resolve one index against `n` elements already present at this point in the
+ * file. A positive index is 1-based (`n` is its exclusive upper bound); a
+ * negative index counts back from the most recent element. `*out` receives the
+ * 0-based index on TOBJ_REF_OK and -1 otherwise. */
+static int TOBJ_T(ref_index)(int idx, size_t n, int *out) {
+  *out = -1;
+  if (idx == 0) return TOBJ_REF_ZERO;
   if (idx > 0) {
+    if ((size_t)idx > n) return TOBJ_REF_RANGE;
     *out = idx - 1;
-    return true;
+    return TOBJ_REF_OK;
   }
-  if (idx == 0) {
-    *out = -1;
-    return false; /* zero index: invalid per spec */
-  }
+  /* negative: relative to the elements already present */
   long long r = (long long)n + idx;
-  if (r < 0) {
-    *out = -1;
-    return false;
-  }
+  if (r < 0) return TOBJ_REF_RANGE;
   *out = (int)r;
-  return true;
+  return TOBJ_REF_OK;
 }
 
-/* Parse one corner "v[/[vt][/vn]]" against explicit counts. Returns true if a
- * (possibly relative) vertex index was parsed and is in range. */
-static bool TOBJ_T(parse_corner_n)(const char *tok, size_t len, size_t numv,
-                                   size_t numvt, size_t numvn,
-                                   tobj_index *out) {
+/* Lenient historical resolution, byte-for-byte the old fix_index behaviour
+ * (a forward reference is kept verbatim, a zero or too-deep relative index
+ * becomes -1) so non-strict loads keep their established output and
+ * diagnostics. */
+static void TOBJ_T(fix_index)(int idx, size_t n, int *out) {
+  if (idx > 0) {
+    *out = idx - 1;
+    return;
+  }
+  if (idx == 0) {
+    *out = -1; /* zero index: invalid per spec */
+    return;
+  }
+  long long r = (long long)n + idx;
+  *out = r < 0 ? -1 : (int)r;
+}
+
+/* Emit the strict-mode diagnostic for a rejected reference, naming the
+ * statement kind ("face"/"line"/"point"/"surf"/"curv"/"curv2"), its line, the
+ * corner position within the statement and the offending field. */
+static void TOBJ_T(ref_error)(TOBJ_T(tobj_builder) * b, const char *kind,
+                              size_t corner_no, size_t corner_count,
+                              const tobj_ref_err *re) {
+  tobj_msg m;
+  tobj_msg_init(&m);
+  tobj_msg_put(&m, "tinyobjc: invalid ");
+  tobj_msg_put(&m, kind);
+  tobj_msg_put(&m, " at line ");
+  tobj_msg_put_size(&m, b->line);
+  tobj_msg_put(&m, ", corner ");
+  tobj_msg_put_size(&m, corner_no + 1u);
+  tobj_msg_put(&m, " of ");
+  tobj_msg_put_size(&m, corner_count);
+  tobj_msg_put(&m, ": ");
+  tobj_msg_put(&m, re->field == TOBJ_REF_FIELD_V
+                       ? "vertex"
+                       : re->field == TOBJ_REF_FIELD_VT ? "texcoord"
+                                                        : "normal");
+  if (re->code == TOBJ_REF_MALFORMED) {
+    tobj_msg_put(&m, " index is not an integer\n");
+  } else {
+    tobj_msg_put(&m, " index ");
+    tobj_msg_put_int(&m, (long long)re->raw[re->field]);
+    if (re->code == TOBJ_REF_ZERO) {
+      tobj_msg_put(&m, " is zero (index 0 is invalid)\n");
+    } else {
+      tobj_msg_put(&m, " does not reference an existing element\n");
+    }
+  }
+  tobj_diag_append(b->diag, b->alloc, TOBJ_SEV_ERROR, b->line, m.buf);
+}
+
+/* Record a failed reference for field `field`. The first failure overall wins
+ * `field`/`code`; every failing field is remembered in the bitmask so the
+ * lenient fallback can re-resolve each of them. */
+static void TOBJ_T(ref_record)(tobj_ref_err *re, int field, int code, int raw) {
+  if (!re) return;
+  if (re->flags == 0) {
+    re->field = field;
+    re->code = code;
+  }
+  re->flags |= 1 << field;
+  re->raw[field] = raw;
+}
+
+/* Parse one corner "v[/[vt][/vn]]" against explicit counts. Every index written
+ * in the token is resolved with ref_index; fields the token omits stay -1 (a
+ * missing attribute is "absent", never a real index). All three fields are
+ * resolved even when an earlier one fails, exactly as the historical parser
+ * did. Returns TOBJ_REF_OK when every written reference resolves, otherwise the
+ * first failure's code, with the failures recorded in *re (optional). */
+static int TOBJ_T(parse_corner_n)(const char *tok, size_t len, size_t numv,
+                                  size_t numvt, size_t numvn, tobj_index *out,
+                                  tobj_ref_err *re) {
   out->vertex_index = -1;
   out->normal_index = -1;
   out->texcoord_index = -1;
+  if (re) {
+    re->flags = 0;
+    re->field = TOBJ_REF_FIELD_V;
+    re->code = TOBJ_REF_OK;
+    re->raw[0] = re->raw[1] = re->raw[2] = 0;
+  }
 
   tobj_cursor c;
   tobj_cur_init(&c, tok, len);
   int vi;
-  if (!tobj_scan_int(&c.p, c.end, &vi)) return false;
-  bool ok = TOBJ_T(fix_index)(vi, numv, &out->vertex_index);
+  if (!tobj_scan_int(&c.p, c.end, &vi)) {
+    TOBJ_T(ref_record)(re, TOBJ_REF_FIELD_V, TOBJ_REF_MALFORMED, 0);
+    return TOBJ_REF_MALFORMED;
+  }
+  int first_code = TOBJ_REF_OK;
+  int code = TOBJ_T(ref_index)(vi, numv, &out->vertex_index);
+  if (code != TOBJ_REF_OK) {
+    TOBJ_T(ref_record)(re, TOBJ_REF_FIELD_V, code, vi);
+    first_code = code;
+  }
   if (c.p < c.end && *c.p == '/') {
     c.p++;
     if (c.p < c.end && *c.p != '/') {
       int ti;
-      if (tobj_scan_int(&c.p, c.end, &ti))
-        TOBJ_T(fix_index)(ti, numvt, &out->texcoord_index);
+      if (tobj_scan_int(&c.p, c.end, &ti)) {
+        code = TOBJ_T(ref_index)(ti, numvt, &out->texcoord_index);
+        if (code != TOBJ_REF_OK) {
+          TOBJ_T(ref_record)(re, TOBJ_REF_FIELD_VT, code, ti);
+          if (first_code == TOBJ_REF_OK) first_code = code;
+        }
+      }
     }
     if (c.p < c.end && *c.p == '/') {
       c.p++;
       int ni;
-      if (tobj_scan_int(&c.p, c.end, &ni))
-        TOBJ_T(fix_index)(ni, numvn, &out->normal_index);
+      if (tobj_scan_int(&c.p, c.end, &ni)) {
+        code = TOBJ_T(ref_index)(ni, numvn, &out->normal_index);
+        if (code != TOBJ_REF_OK) {
+          TOBJ_T(ref_record)(re, TOBJ_REF_FIELD_VN, code, ni);
+          if (first_code == TOBJ_REF_OK) first_code = code;
+        }
+      }
     }
   }
-  return ok;
+  return first_code;
 }
 
-/* Parse one face/line/point corner using the builder's current counts. */
-static void TOBJ_T(parse_corner)(TOBJ_T(tobj_builder) * b, const char *tok,
-                                 size_t len, tobj_index *out) {
-  bool ok = TOBJ_T(parse_corner_n)(tok, len, TOBJ_T(cnt_v)(b),
-                                   TOBJ_T(cnt_vt)(b), TOBJ_T(cnt_vn)(b), out);
-  if (!ok && out->vertex_index < 0)
+/* Re-apply the historical lenient resolution to every field that failed to
+ * resolve, against the same explicit counts used to parse the corner (the
+ * builder's live counts and the streaming loader's running counters differ).
+ * Only the failed fields are touched, so valid references and absent
+ * attributes keep their positions. When `warn` is set, a vertex reference that
+ * ends up negative is reported exactly as the historical parser did. */
+static void TOBJ_T(ref_fallback)(TOBJ_T(tobj_builder) * b, tobj_index *out,
+                                 const tobj_ref_err *re, size_t numv,
+                                 size_t numvt, size_t numvn, bool warn) {
+  if (re->flags & (1 << TOBJ_REF_FIELD_V)) {
+    TOBJ_T(fix_index)(re->raw[TOBJ_REF_FIELD_V], numv, &out->vertex_index);
+  }
+  if (re->flags & (1 << TOBJ_REF_FIELD_VT)) {
+    TOBJ_T(fix_index)(re->raw[TOBJ_REF_FIELD_VT], numvt, &out->texcoord_index);
+  }
+  if (re->flags & (1 << TOBJ_REF_FIELD_VN)) {
+    TOBJ_T(fix_index)(re->raw[TOBJ_REF_FIELD_VN], numvn, &out->normal_index);
+  }
+  if (warn && out->vertex_index < 0)
     TOBJ_T(b_warn)(b, "tinyobjc: invalid vertex index in face\n");
+}
+
+/* Parse one face/line/point corner using the builder's current counts. In
+ * strict mode a bad reference fails the load with TOBJ_ERR_PARSE; otherwise the
+ * historical lenient resolution (with a warning) is applied. */
+static bool TOBJ_T(parse_corner)(TOBJ_T(tobj_builder) * b, const char *kind,
+                                 size_t corner_no, size_t corner_count,
+                                 const char *tok, size_t len, tobj_index *out) {
+  tobj_ref_err re;
+  int code = TOBJ_T(parse_corner_n)(tok, len, TOBJ_T(cnt_v)(b),
+                                    TOBJ_T(cnt_vt)(b), TOBJ_T(cnt_vn)(b), out,
+                                    &re);
+  if (code == TOBJ_REF_OK) return true;
+  if (b->strict) {
+    TOBJ_T(ref_error)(b, kind, corner_no, corner_count, &re);
+    return TOBJ_T(b_fail)(b, TOBJ_ERR_PARSE);
+  }
+  TOBJ_T(ref_fallback)(b, out, &re, TOBJ_T(cnt_v)(b), TOBJ_T(cnt_vt)(b),
+                       TOBJ_T(cnt_vn)(b), true);
+  return true;
 }
 
 /* ----------------------------------------------------------------------- */
@@ -352,16 +480,33 @@ static bool TOBJ_T(emit_face)(TOBJ_T(tobj_builder) * b, size_t arity) {
   return true;
 }
 
+/* Count whitespace-separated tokens from `c` onwards without consuming the
+ * caller's cursor. Only used on the strict-error path to report the corner
+ * position within the whole statement, so it never costs anything on
+ * successful loads. */
+static size_t TOBJ_T(count_tokens)(const tobj_cursor *c) {
+  tobj_cursor t = *c;
+  const char *tok;
+  size_t tl;
+  size_t n = 0;
+  while (tobj_next_token(&t, &tok, &tl)) n++;
+  return n;
+}
+
 static bool TOBJ_T(handle_f)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
   b->corners.count = 0;
   const char *tok;
   size_t tlen;
   size_t arity = 0;
+  /* Corner numbering in diagnostics needs the face arity up front; compute it
+   * once here rather than once per corner, and only in strict mode. */
+  size_t ntok = b->strict ? TOBJ_T(count_tokens)(c) : 0u;
   while (tobj_next_token(c, &tok, &tlen)) {
     if (arity >= b->caps.arity) return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
     tobj_index *slot = (tobj_index *)tobj_vec_push(&b->corners, b->alloc);
     if (!slot) return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
-    TOBJ_T(parse_corner)(b, tok, tlen, slot);
+    if (!TOBJ_T(parse_corner)(b, "face", arity, ntok, tok, tlen, slot))
+      return false;
     arity++;
   }
   if (arity < 3) {
@@ -377,10 +522,12 @@ static bool TOBJ_T(handle_l)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
   size_t tlen;
   size_t cnt = 0;
   size_t start = b->l_idx.count;
+  size_t ntok = b->strict ? TOBJ_T(count_tokens)(c) : 0u;
   while (tobj_next_token(c, &tok, &tlen)) {
     if (cnt >= b->caps.arity) return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
     tobj_index idx;
-    TOBJ_T(parse_corner)(b, tok, tlen, &idx);
+    if (!TOBJ_T(parse_corner)(b, "line", cnt, ntok, tok, tlen, &idx))
+      return false;
     if (!tobj_vec_append(&b->l_idx, &idx, 1, b->alloc))
       return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
     cnt++;
@@ -400,12 +547,16 @@ static bool TOBJ_T(handle_l)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
 static bool TOBJ_T(handle_p)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
   const char *tok;
   size_t tlen;
+  size_t cnt = 0;
+  size_t ntok = b->strict ? TOBJ_T(count_tokens)(c) : 0u;
   while (tobj_next_token(c, &tok, &tlen)) {
     tobj_index idx;
-    TOBJ_T(parse_corner)(b, tok, tlen, &idx);
+    if (!TOBJ_T(parse_corner)(b, "point", cnt, ntok, tok, tlen, &idx))
+      return false;
     if (!tobj_vec_append(&b->p_idx, &idx, 1, b->alloc))
       return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
     b->cur_has_prims = true;
+    cnt++;
   }
   return true;
 }
@@ -939,6 +1090,44 @@ static void TOBJ_T(ff_loops)(TOBJ_T(tobj_builder) * b, tobj_cursor *c,
   }
 }
 
+/* Count integer tokens remaining in `c` without consuming the caller's cursor.
+ * Strict-mode diagnostics only. */
+static size_t TOBJ_T(count_ints)(const tobj_cursor *c) {
+  tobj_cursor t = *c;
+  int v;
+  size_t n = 0;
+  while (tobj_scan_int(&t.p, t.end, &v)) n++;
+  return n;
+}
+
+/* Parse the run of integer control-point references of a `curv`/`curv2`
+ * statement against `n` existing elements, appending to b->ff_cp_int. Strict
+ * mode rejects any reference that does not resolve. */
+static bool TOBJ_T(ff_ctrl_points)(TOBJ_T(tobj_builder) * b, tobj_cursor *c,
+                                   const char *kind, size_t n) {
+  size_t ntok = b->strict ? TOBJ_T(count_ints)(c) : 0u;
+  size_t corner = 0;
+  int vi;
+  while (tobj_scan_int(&c->p, c->end, &vi)) {
+    tobj_ref_err re;
+    int r;
+    int code = TOBJ_T(ref_index)(vi, n, &r);
+    if (code != TOBJ_REF_OK) {
+      if (b->strict) {
+        tobj_memset(&re, 0, sizeof re);
+        TOBJ_T(ref_record)(&re, TOBJ_REF_FIELD_V, code, vi);
+        TOBJ_T(ref_error)(b, kind, corner, ntok, &re);
+        return TOBJ_T(b_fail)(b, TOBJ_ERR_PARSE);
+      }
+      TOBJ_T(fix_index)(vi, n, &r);
+    }
+    if (!tobj_vec_append(&b->ff_cp_int, &r, 1, b->alloc))
+      return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
+    corner++;
+  }
+  return true;
+}
+
 static bool TOBJ_T(handle_freeform)(TOBJ_T(tobj_builder) * b, const char *tok,
                                     size_t tl, tobj_cursor *c) {
   if (tobj_slice_eq(tok, tl, "vp")) {
@@ -989,32 +1178,17 @@ static bool TOBJ_T(handle_freeform)(TOBJ_T(tobj_builder) * b, const char *tok,
     double a, bb;
     b->ff_u0 = tobj_scan_double(&c->p, c->end, &a) ? (TOBJ_REAL)a : (TOBJ_REAL)0;
     b->ff_u1 = tobj_scan_double(&c->p, c->end, &bb) ? (TOBJ_REAL)bb : (TOBJ_REAL)0;
-    int vi;
-    size_t numv = TOBJ_T(cnt_v)(b);
-    while (tobj_scan_int(&c->p, c->end, &vi)) {
-      int r;
-      TOBJ_T(fix_index)(vi, numv, &r);
-      if (!tobj_vec_append(&b->ff_cp_int, &r, 1, b->alloc))
-        return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
-    }
-    return true;
+    return TOBJ_T(ff_ctrl_points)(b, c, "curv", TOBJ_T(cnt_v)(b));
   }
   if (tobj_slice_eq(tok, tl, "curv2")) {
     TOBJ_T(ff_reset_elem)(b);
     b->ff_active = true;
     b->ff_kind = 2;
-    int vi;
     size_t numvp = b->prefilled
                        ? b->run_numvp
                        : (b->ff_vp_comps ? b->ff_vp.count / (size_t)b->ff_vp_comps
                                          : 0);
-    while (tobj_scan_int(&c->p, c->end, &vi)) {
-      int r;
-      TOBJ_T(fix_index)(vi, numvp, &r);
-      if (!tobj_vec_append(&b->ff_cp_int, &r, 1, b->alloc))
-        return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
-    }
-    return true;
+    return TOBJ_T(ff_ctrl_points)(b, c, "curv2", numvp);
   }
   if (tobj_slice_eq(tok, tl, "surf")) {
     TOBJ_T(ff_reset_elem)(b);
@@ -1027,12 +1201,24 @@ static bool TOBJ_T(handle_freeform)(TOBJ_T(tobj_builder) * b, const char *tok,
     b->ff_t1 = tobj_scan_double(&c->p, c->end, &t1) ? (TOBJ_REAL)t1 : 0;
     const char *t2;
     size_t l2;
+    size_t ntok = b->strict ? TOBJ_T(count_tokens)(c) : 0u;
+    size_t corner = 0;
     while (tobj_next_token(c, &t2, &l2)) {
       tobj_index idx;
-      TOBJ_T(parse_corner_n)(t2, l2, TOBJ_T(cnt_v)(b), TOBJ_T(cnt_vt)(b),
-                             TOBJ_T(cnt_vn)(b), &idx);
+      tobj_ref_err re;
+      int code = TOBJ_T(parse_corner_n)(t2, l2, TOBJ_T(cnt_v)(b),
+                                        TOBJ_T(cnt_vt)(b), TOBJ_T(cnt_vn)(b),
+                                        &idx, &re);
+      if (code != TOBJ_REF_OK && b->strict) {
+        TOBJ_T(ref_error)(b, "surf", corner, ntok, &re);
+        return TOBJ_T(b_fail)(b, TOBJ_ERR_PARSE);
+      }
+      if (code != TOBJ_REF_OK)
+        TOBJ_T(ref_fallback)(b, &idx, &re, TOBJ_T(cnt_v)(b), TOBJ_T(cnt_vt)(b),
+                             TOBJ_T(cnt_vn)(b), false);
       if (!tobj_vec_append(&b->ff_cp_idx, &idx, 1, b->alloc))
         return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
+      corner++;
     }
     return true;
   }
@@ -1547,6 +1733,7 @@ tobj_result TOBJ_T(tobj_load_obj_from_memory)(TOBJ_T(tobj_scene) * out,
   b.caps = tobj_resolve_caps(cfg);
   b.err = TOBJ_OK;
   b.triangulate = cfg->triangulate;
+  b.strict = cfg->strict_index_validation;
   b.cur_material = -1;
   b.cur_smooth = 0;
   b.cur_name = NULL;
@@ -1832,6 +2019,7 @@ tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
   b.cfg = cfg;
   b.caps = tobj_resolve_caps(cfg);
   b.err = TOBJ_OK;
+  b.strict = cfg->strict_index_validation;
   TOBJ_T(builder_init)(&b);
   void *ud = cb->user_data;
 
@@ -1902,13 +2090,29 @@ tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
       b.corners.count = 0;
       const char *t2;
       size_t l2;
+      size_t ntok = b.strict ? TOBJ_T(count_tokens)(&c) : 0u;
+      size_t corner = 0;
       while (tobj_next_token(&c, &t2, &l2)) {
         tobj_index *slot = (tobj_index *)tobj_vec_push(&b.corners, &alloc);
         if (!slot) {
           b.err = TOBJ_ERR_ALLOC;
           break;
         }
-        TOBJ_T(parse_corner_n)(t2, l2, numv, numvt, numvn, slot);
+        tobj_ref_err re;
+        int code = TOBJ_T(parse_corner_n)(t2, l2, numv, numvt, numvn, slot, &re);
+        if (code != TOBJ_REF_OK) {
+          if (b.strict) {
+            TOBJ_T(ref_error)(&b, kind == 'f' ? "face"
+                              : kind == 'l'   ? "line"
+                                              : "point",
+                              corner, ntok, &re);
+            b.err = TOBJ_ERR_PARSE;
+            b.corners.count--; /* drop the rejected corner */
+            break;
+          }
+          TOBJ_T(ref_fallback)(&b, slot, &re, numv, numvt, numvn, false);
+        }
+        corner++;
       }
       if (b.err != TOBJ_OK) break;
       int nidx = tobj_size_to_int(b.corners.count);

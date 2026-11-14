@@ -85,6 +85,97 @@ static bool tobj_slice_eq(const char *p, size_t len, const char *lit) {
   return lit[len] == '\0';
 }
 
+/* Fixed-capacity message builder. Appends never allocate (freestanding-safe)
+ * and never write past TOBJ_MSG_CAP-1 bytes, so messages can be handed to the
+ * aggregated diag buffers as well as to the on_message callback. */
+#define TOBJ_MSG_CAP 256u
+
+typedef struct tobj_msg {
+  char buf[TOBJ_MSG_CAP];
+  size_t len;
+} tobj_msg;
+
+static void tobj_msg_init(tobj_msg *m) {
+  m->len = 0;
+  m->buf[0] = '\0';
+}
+
+static void tobj_msg_char(tobj_msg *m, char c) {
+  if (m->len + 1 >= TOBJ_MSG_CAP) return;
+  m->buf[m->len++] = c;
+  m->buf[m->len] = '\0';
+}
+
+static void tobj_msg_put(tobj_msg *m, const char *s) {
+  while (*s) tobj_msg_char(m, *s++);
+}
+
+/* Append an unsigned decimal value (no libc formatting). */
+static void tobj_msg_put_size(tobj_msg *m, size_t v) {
+  char digits[32];
+  size_t n = 0;
+  if (v == 0) {
+    tobj_msg_char(m, '0');
+    return;
+  }
+  while (v && n < sizeof digits) {
+    digits[n++] = (char)('0' + (v % 10u));
+    v /= 10u;
+  }
+  while (n) tobj_msg_char(m, digits[--n]);
+}
+
+/* Append a signed decimal value (no libc formatting). */
+static void tobj_msg_put_int(tobj_msg *m, long long v) {
+  char digits[32];
+  size_t n = 0;
+  unsigned long long mag;
+  if (v < 0) {
+    tobj_msg_char(m, '-');
+    mag = (unsigned long long)(-(v + 1)) + 1u; /* avoid LLONG_MIN overflow */
+  } else {
+    mag = (unsigned long long)v;
+  }
+  if (mag == 0) {
+    tobj_msg_char(m, '0');
+    return;
+  }
+  while (mag && n < sizeof digits) {
+    digits[n++] = (char)('0' + (mag % 10u));
+    mag /= 10u;
+  }
+  while (n) tobj_msg_char(m, digits[--n]);
+}
+
+/* Outcome of resolving one .obj index reference. Shared by both precision
+ * instantiations (precision-independent). Resolving is separate from deciding
+ * what to do about a bad reference: the lenient and strict modes share this
+ * predicate so they can never disagree about what "legal" means. */
+enum {
+  TOBJ_REF_OK = 0,     /* resolves to an element that already exists */
+  TOBJ_REF_MALFORMED,  /* token is not an integer */
+  TOBJ_REF_ZERO,       /* literal 0: invalid in .obj */
+  TOBJ_REF_RANGE       /* past the end (positive) or before the start (relative) */
+};
+
+/* Which of the three reference kinds a tobj_ref_err describes. Also used as
+ * bit positions in tobj_ref_err::flags. */
+enum {
+  TOBJ_REF_FIELD_V = 0,
+  TOBJ_REF_FIELD_VT = 1,
+  TOBJ_REF_FIELD_VN = 2
+};
+
+/* One rejected reference, kept so the caller can name the failing corner and
+ * field. `raw` holds the index exactly as written, per field (0 when the field
+ * was absent or malformed). */
+typedef struct tobj_ref_err {
+  int flags;  /* bitmask of TOBJ_REF_FIELD_* bits that failed */
+  int field;  /* field of the first failure */
+  int code;   /* code of the first failure */
+  int raw[3]; /* written index per field, indexed by TOBJ_REF_FIELD_* */
+} tobj_ref_err;
+
 /* ======================================================================= */
 /* [3] overflow-safe size arithmetic                                       */
 /* ======================================================================= */
@@ -705,6 +796,7 @@ tobj_load_config tobj_default_config(void) {
   c.vertex_color_fallback = true;
   c.parse_freeform = false;
   c.use_arena = false;
+  c.strict_index_validation = false;
   c.num_threads = -1;
   /* 0 caps select built-in defaults in the loader */
   return c;
@@ -1016,6 +1108,11 @@ static void tobj_run_parallel(tobj_thunk *thunks, int n) {
 int tobj_fuzz_one(const uint8_t *data, size_t size) {
   tobj_scene_f s;
   tobj_load_config cfg = tobj_default_config();
+  if (tobj_load_obj_from_memory_f(&s, data, size, &cfg, NULL) == TOBJ_OK) {
+    tobj_scene_free_f(&s);
+  }
+  /* Also drive the strict index-validation path so it gets fuzz coverage. */
+  cfg.strict_index_validation = true;
   if (tobj_load_obj_from_memory_f(&s, data, size, &cfg, NULL) == TOBJ_OK) {
     tobj_scene_free_f(&s);
   }
